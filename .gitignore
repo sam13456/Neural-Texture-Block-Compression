@@ -1,7 +1,7 @@
 /.venv
 /Bricks090_2K-PNG
 /Endpoints_Extract_Training.py
-/Endpoint_network
+/Endpoint_network_old
 /ruby_ref_bc1
 /ruby_ref_bc1_paper
 /test_inference_dense.py
