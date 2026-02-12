@@ -24,22 +24,12 @@ DXGI_FORMAT_BC1_UNORM_SRGB = 72
 # =========================
 CONFIG = {
     "cli": r"D:\Compressonatorcli\bin\CLI\compressonatorcli.exe",
-    "source_image": r"D:\BC1 extract\Bricks090_diffuse\Bricks090_2K-PNG_Color.png",
-    "out_dir": r"D:\BC1 extract\Bricks090_diffuse_2K_test",
+    "source_image": r"D:\BC1 extract\Bricks090_diffuse_8K\Bricks090_8K-PNG_Color.png",
+    "out_dir": r"D:\BC1 extract\Bricks090_diffuse_8K_model",
     "encode_with": "HPC",
     "refine_steps": 2,
     "include_meta": False,
 }
-
-
-def rgb565_to_rgb888(c: int) -> Tuple[int, int, int]:
-    r5 = (c >> 11) & 0x1F
-    g6 = (c >> 5) & 0x3F
-    b5 = c & 0x1F
-    r = (r5 * 255 + 15) // 31
-    g = (g6 * 255 + 31) // 63
-    b = (b5 * 255 + 15) // 31
-    return (int(r), int(g), int(b))
 
 
 def rgb565_to_q01(c: int) -> List[float]:
@@ -143,16 +133,14 @@ def parse_dds_bc1_endpoints(dds_path: Path) -> Dict[str, Any]:
     if len(data) < needed:
         raise ValueError("DDS truncated: not enough BC1 blocks.")
 
-    endpoints_rgb565: List[List[int]] = []
-    endpoints_rgb888: List[List[List[int]]] = []
+    # Vectorised: read all BC1 blocks at once (8 bytes each: 2B c0, 2B c1, 4B indices)
+    import numpy as np
+    raw = np.frombuffer(data, dtype=np.uint16, offset=offset, count=num_blocks * 4)
+    # raw is [c0_0, c1_0, idx_lo_0, idx_hi_0, c0_1, c1_1, ...]
+    c0_arr = raw[0::4].astype(np.int32)  # (N,) every 4th uint16 starting at 0
+    c1_arr = raw[1::4].astype(np.int32)  # (N,) every 4th uint16 starting at 1
 
-    p = offset
-    for _ in range(num_blocks):
-        c0 = int.from_bytes(data[p:p+2], "little")
-        c1 = int.from_bytes(data[p+2:p+4], "little")
-        endpoints_rgb565.append([c0, c1])
-        endpoints_rgb888.append([list(rgb565_to_rgb888(c0)), list(rgb565_to_rgb888(c1))])
-        p += 8
+    endpoints_rgb565 = np.stack([c0_arr, c1_arr], axis=-1)              # (N, 2)
 
     return {
         "width": int(width),
@@ -162,7 +150,6 @@ def parse_dds_bc1_endpoints(dds_path: Path) -> Dict[str, Any]:
         "block_order": "row_major",
         "format": "BC1",
         "endpoints_rgb565": endpoints_rgb565,
-        "endpoints_rgb888": endpoints_rgb888,
     }
 
 
@@ -197,25 +184,36 @@ def convert_reference_to_dataset(
     include_meta: bool = True,
 ) -> None:
     """Convert parsed reference endpoints directly into a training dataset JSON."""
+    import numpy as np
+
     W, H = int(ref["width"]), int(ref["height"])
     Bx, By = int(ref["blocks_x"]), int(ref["blocks_y"])
-    eps = ref["endpoints_rgb565"]
-    n = len(eps)
+    eps = ref["endpoints_rgb565"]  # numpy (N,2) int32 from parse_dds_bc1_endpoints
+    n = int(eps.shape[0]) if hasattr(eps, 'shape') else len(eps)
 
-    bxby: List[List[int]] = []
-    ep_q01: List[List[float]] = []
+    # Vectorised bxby: row-major block indices
+    idx = np.arange(n, dtype=np.int32)
+    bxby = np.stack([idx % Bx, idx // Bx], axis=-1)  # (N, 2) int32
 
-    for i, pair in enumerate(eps):
-        c0, c1 = int(pair[0]), int(pair[1])
-        bx = i % Bx
-        by = i // Bx
+    # Vectorised RGB565 -> q01 for both c0 and c1
+    if not isinstance(eps, np.ndarray):
+        eps = np.asarray(eps, dtype=np.int32)
+    c0 = eps[:, 0]
+    c1 = eps[:, 1]
 
-        bxby.append([bx, by])
-        ep_q01.append(rgb565_to_q01(c0) + rgb565_to_q01(c1))
+    def rgb565_to_q01_vec(c):
+        r5 = ((c >> 11) & 0x1F).astype(np.float32) / 31.0
+        g6 = ((c >> 5) & 0x3F).astype(np.float32) / 63.0
+        b5 = (c & 0x1F).astype(np.float32) / 31.0
+        return np.stack([r5, g6, b5], axis=-1)  # (N, 3)
+
+    q01_c0 = rgb565_to_q01_vec(c0)  # (N, 3)
+    q01_c1 = rgb565_to_q01_vec(c1)  # (N, 3)
+    ep_q01 = np.concatenate([q01_c0, q01_c1], axis=-1)  # (N, 6)
 
     out: Dict[str, Any] = {
-        "inputs": {"bxby": bxby},
-        "targets": {"ep_q01": ep_q01},
+        "inputs": {"bxby": bxby.tolist()},
+        "targets": {"ep_q01": ep_q01.tolist()},
     }
 
     if include_meta:
@@ -230,7 +228,7 @@ def convert_reference_to_dataset(
             "source_image": source_image,
         }
 
-    out_json.write_text(json.dumps(out, indent=2))
+    out_json.write_text(json.dumps(out))
     print("Wrote dataset:", out_json)
 
     # Compact coords file: just the grid dimensions (st/bxby are derived from these)
