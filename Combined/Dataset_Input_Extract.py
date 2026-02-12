@@ -12,12 +12,24 @@ import json
 import re
 import struct
 import subprocess
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 DXGI_FORMAT_BC1_UNORM = 71
 DXGI_FORMAT_BC1_UNORM_SRGB = 72
+
+
+# =========================
+# CONFIG (edit these)
+# =========================
+CONFIG = {
+    "cli": r"D:\Compressonatorcli\bin\CLI\compressonatorcli.exe",
+    "source_image": r"D:\BC1 extract\Bricks090_diffuse\Bricks090_2K-PNG_Color.png",
+    "out_dir": r"D:\BC1 extract\Bricks090_diffuse_2K_test",
+    "encode_with": "HPC",
+    "refine_steps": 2,
+    "include_meta": False,
+}
 
 
 def rgb565_to_rgb888(c: int) -> Tuple[int, int, int]:
@@ -179,47 +191,31 @@ def get_reference_endpoints_bc1(
 
 
 def convert_reference_to_dataset(
-    ref_json: Path,
+    ref: Dict[str, Any],
     out_json: Path,
+    source_image: Optional[str] = None,
     include_meta: bool = True,
-    keep_only_c0_gt_c1: bool = False,
 ) -> None:
-    d = json.loads(ref_json.read_text())
-
-    W, H = int(d["width"]), int(d["height"])
-    Bx, By = int(d["blocks_x"]), int(d["blocks_y"])
-    eps = d["endpoints_rgb565"]
+    """Convert parsed reference endpoints directly into a training dataset JSON."""
+    W, H = int(ref["width"]), int(ref["height"])
+    Bx, By = int(ref["blocks_x"]), int(ref["blocks_y"])
+    eps = ref["endpoints_rgb565"]
     n = len(eps)
 
-    st: List[List[float]] = []
     bxby: List[List[int]] = []
     ep_q01: List[List[float]] = []
-    c0_gt_c1: List[int] = []
-    ep_rgb565: List[List[int]] = []
 
     for i, pair in enumerate(eps):
         c0, c1 = int(pair[0]), int(pair[1])
         bx = i % Bx
         by = i // Bx
 
-        s = bx / (Bx - 1) if Bx > 1 else 0.0
-        t = by / (By - 1) if By > 1 else 0.0
-
-        flag = 1 if (c0 > c1) else 0
-        if keep_only_c0_gt_c1 and flag == 0:
-            continue
-
         bxby.append([bx, by])
-        st.append([float(s), float(t)])
-
-        ep_rgb565.append([c0, c1])
         ep_q01.append(rgb565_to_q01(c0) + rgb565_to_q01(c1))
-        c0_gt_c1.append(flag)
 
     out: Dict[str, Any] = {
-        "inputs": {"st": st, "bxby": bxby},
-        "targets": {"ep_rgb565": ep_rgb565, "ep_q01": ep_q01},
-        "flags": {"c0_gt_c1": c0_gt_c1},
+        "inputs": {"bxby": bxby},
+        "targets": {"ep_q01": ep_q01},
     }
 
     if include_meta:
@@ -228,57 +224,37 @@ def convert_reference_to_dataset(
             "height": H,
             "blocks_x": Bx,
             "blocks_y": By,
-            "block_order": d.get("block_order", "row_major"),
-            "format": d.get("format", "BC1"),
+            "block_order": ref.get("block_order", "row_major"),
+            "format": ref.get("format", "BC1"),
             "num_blocks_total": n,
-            "num_blocks_kept": len(ep_rgb565),
-            "filtered_c0_gt_c1": bool(keep_only_c0_gt_c1),
-            "source_image": d.get("compress_meta", {}).get("source_image"),
+            "source_image": source_image,
         }
 
     out_json.write_text(json.dumps(out, indent=2))
     print("Wrote dataset:", out_json)
 
+    # Compact coords file: just the grid dimensions (st/bxby are derived from these)
+    coords_json = out_json.parent / "Inference_input.json"
+    coords_json.write_text(json.dumps({"blocks_x": Bx, "blocks_y": By}))
+    print("Wrote coords:", coords_json)
 
-@dataclass
-class Config:
-    CLI: str
-    IMG: str
-    OUT: str
-    encode_with: str = "HPC"
-    refine_steps: int = 2
-    KEEP_ONLY_C0_GT_C1: bool = False
-    INCLUDE_META: bool = True
 
 
 if __name__ == "__main__":
-    cfg = Config(
-        CLI=r"D:\Compressonatorcli\bin\CLI\compressonatorcli.exe",
-        IMG=r"D:\BC1 extract\Bricks090_diffuse_8K\Bricks090_8K-PNG_Color.png",
-        OUT=r"D:\BC1 extract\Bricks090_diffuse_8K",
-        encode_with="HPC",
-        refine_steps=2,
-        KEEP_ONLY_C0_GT_C1=False,  # set True to drop BC1 3-color mode blocks
-        INCLUDE_META=False,
-    )
+    cfg = CONFIG
 
     ref, ref_meta, out_dds = get_reference_endpoints_bc1(
-        cfg.CLI, cfg.IMG, cfg.OUT, encode_with=cfg.encode_with, refine_steps=cfg.refine_steps
+        cfg["cli"], cfg["source_image"], cfg["out_dir"],
+        encode_with=cfg["encode_with"], refine_steps=cfg["refine_steps"],
     )
 
-    out_dir = Path(cfg.OUT)
+    out_dir = Path(cfg["out_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    ref_json = out_dir / "bc1_reference_endpoints.json"
-    ref_out = dict(ref)
-    ref_out["compress_meta"] = ref_meta
-    ref_json.write_text(json.dumps(ref_out, indent=2))
-    print("Saved reference endpoints:", ref_json)
     print("DDS written to:", out_dds)
 
     convert_reference_to_dataset(
-        ref_json=ref_json,
-        out_json=out_dir / "bc1_endpoint_dataset.json",
-        include_meta=cfg.INCLUDE_META,
-        keep_only_c0_gt_c1=cfg.KEEP_ONLY_C0_GT_C1,
+        ref=ref,
+        out_json=out_dir / "Train_dataset.json",
+        source_image=cfg["source_image"],
+        include_meta=cfg["include_meta"],
     )
