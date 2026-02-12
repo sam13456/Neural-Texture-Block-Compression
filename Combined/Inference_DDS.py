@@ -31,11 +31,12 @@ No "bash" needed: just edit CONFIG below and run the .py normally from your IDE 
 
 from __future__ import annotations
 
+import json
 import math
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict
 
 import numpy as np
 from PIL import Image
@@ -45,33 +46,30 @@ import torch
 from Network_endpoint import EndpointNetwork, pack_rgb565_from_epq01, bc1_palette_from_endpoints, endpoints6_to_e0e1, _BC1_W
 from Network_color import ColorNetwork
 
-from state_dict_compress import decompress_state_dict
+from Model_param_compress import decompress_state_dict
 
 
 # =========================
 # CONFIG (edit these)
 # =========================
 CONFIG = {
-    # The image you trained NTBC on (used here mainly for width/height and optional preview comparison)
-    "input_image": r"D:\BC1 extract\Bricks090_diffuse\Bricks090_2K-PNG_Color.png",
+    # Block coordinates file (just blocks_x / blocks_y)
+    "coords_json": r"D:\BC1 extract\Bricks090_diffuse_2K_test\Inference_input.json",
 
-    # Endpoint network checkpoint (either a full checkpoint with {"model_state":...} OR pure state_dict)
-    "endpoint_ckpt": r"D:\BC1 extract\Bricks090_diffuse\runs_endpoint_bc1_steps_compressed\endpoint_net_bc1_final_state_dict_compressed.pt",
-
-    # Color network checkpoint (compressed state_dict)
-    "color_ckpt": r"D:\BC1 extract\Bricks090_diffuse\runs_color_bc1_steps_compressed\color_net_bc1_final_state_dict_compressed.pt",
+    # Single merged checkpoint containing both endpoint + color networks
+    "merged_ckpt": r"D:\BC1 extract\Bricks090_diffuse_2K_test\ntbc_bc1_merged_compressed.pt",
 
     # Output DDS path (DXT1 / BC1)
-    "out_dds": r"D:\BC1 extract\Bricks090_diffuse\ntbc_out.dds",
+    "out_dds": r"D:\BC1 extract\Bricks090_diffuse_2K_test\ntbc_out.dds",
 
     # Optional: also save a decoded preview PNG (what the DDS would decode to)
     "save_preview_png": True,
-    "out_preview_png": r"D:\BC1 extract\Bricks090_diffuse\ntbc_out_preview.png",
+    "out_preview_png": r"D:\BC1 extract\Bricks090_diffuse_2K_test\ntbc_out_preview.png",
 
     # Runtime
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "use_amp": True,           # AMP helps on CUDA
-    "block_batch": 4096,       # blocks per batch (each block = 16 pixels)
+    "block_batch": 131072,       # blocks per batch (each block = 16 pixels)
     "pause_on_exit": False,    # set True if double-clicking and you want the window to stay
 }
 
@@ -175,6 +173,26 @@ def _extract_state_dict(ckpt_obj):
         sd = ckpt_obj
     # Decompress uint8-quantized grids back to float
     return decompress_state_dict(sd)
+
+
+def split_merged_state_dict(merged: dict) -> tuple:
+    """
+    Split a merged compressed state dict into endpoint and color parts.
+
+    Keys prefixed with 'endpoint.' go to the endpoint state dict,
+    keys prefixed with 'color.' go to the color state dict.
+    The prefixes are stripped so the resulting dicts can be loaded directly.
+    """
+    endpoint_sd = {}
+    color_sd = {}
+    for k, v in merged.items():
+        if k.startswith("endpoint."):
+            endpoint_sd[k[len("endpoint."):]] = v
+        elif k.startswith("color."):
+            color_sd[k[len("color."):]] = v
+        else:
+            print(f"[WARN] Unknown key prefix in merged file: {k}")
+    return endpoint_sd, color_sd
 
 
 def _infer_grid_params_from_state(state: Dict[str, torch.Tensor], prefix: str = "encoding.grids."):
@@ -302,9 +320,8 @@ class InferResult:
 
 @torch.no_grad()
 def infer_ntbc_bc1_to_dds(
-    input_image: Path,
-    endpoint_ckpt: Path,
-    color_ckpt: Path,
+    coords_json: Path,
+    merged_ckpt: Path,
     out_dds: Path,
     device: str = "cuda",
     use_amp: bool = True,
@@ -312,20 +329,44 @@ def infer_ntbc_bc1_to_dds(
     save_preview_png: bool = True,
     out_preview_png: Path | None = None,
 ) -> InferResult:
-    # Load and pad image
-    img_u8 = load_image_rgb_u8(input_image)
-    img_u8 = pad_image_to_multiple_of_4(img_u8)
-    H, W, _ = img_u8.shape
-    blocks_x = W // 4
-    blocks_y = H // 4
+    # Load block dimensions from coords file
+    coords = json.loads(coords_json.read_text())
+    blocks_x = int(coords["blocks_x"])
+    blocks_y = int(coords["blocks_y"])
+    W = blocks_x * 4
+    H = blocks_y * 4
 
-    print(f"[INFO] Input image (padded): {W}x{H}  blocks=({blocks_x},{blocks_y})")
+    print(f"[INFO] Texture: {W}x{H}  blocks=({blocks_x},{blocks_y})")
 
-    # Models
-    print("[INFO] Loading EndpointNet...")
-    ep_net = load_endpoint_model(endpoint_ckpt, device=device)
-    print("[INFO] Loading ColorNet...")
-    col_net = load_color_model(color_ckpt, device=device)
+    # Load merged checkpoint and split into endpoint + color
+    print("[INFO] Loading merged checkpoint...")
+    merged = torch.load(merged_ckpt, map_location="cpu")
+    ep_compressed, col_compressed = split_merged_state_dict(merged)
+
+    # Decompress and load endpoint net
+    print("[INFO] Loading EndpointNet from merged file...")
+    ep_state = decompress_state_dict(ep_compressed)
+    nl, br, fr, fd, dt = _infer_grid_params_from_state(ep_state, prefix="encoding.grids.")
+    param_dtype = torch.float16 if (dt == torch.float16 and device == "cuda") else torch.float32
+    ep_net = EndpointNetwork(
+        num_levels=nl, base_resolution=br, finest_resolution=fr,
+        feature_dim=fd, hidden_dim=64, num_hidden_layers=3,
+        param_dtype=param_dtype,
+    ).to(device)
+    ep_net.load_state_dict(ep_state, strict=True)
+    ep_net.eval()
+
+    # Decompress and load color net
+    print("[INFO] Loading ColorNet from merged file...")
+    col_state = decompress_state_dict(col_compressed)
+    nl, br, fr, fd, dt = _infer_grid_params_from_state(col_state, prefix="encoding.grids.")
+    param_dtype = torch.float16 if (dt == torch.float16 and device == "cuda") else torch.float32
+    col_net = ColorNetwork(
+        param_dtype=param_dtype, finest_resolution=fr,
+        base_resolution=br, num_levels=nl,
+    ).to(device)
+    col_net.load_state_dict(col_state, strict=True)
+    col_net.eval()
 
     amp_enabled = bool(use_amp) and (device == "cuda")
     autocast_device = "cuda" if device == "cuda" else "cpu"
@@ -474,9 +515,8 @@ def infer_ntbc_bc1_to_dds(
 def main():
     cfg = CONFIG
     res = infer_ntbc_bc1_to_dds(
-        input_image=Path(cfg["input_image"]),
-        endpoint_ckpt=Path(cfg["endpoint_ckpt"]),
-        color_ckpt=Path(cfg["color_ckpt"]),
+        coords_json=Path(cfg["coords_json"]),
+        merged_ckpt=Path(cfg["merged_ckpt"]),
         out_dds=Path(cfg["out_dds"]),
         device=str(cfg["device"]),
         use_amp=bool(cfg["use_amp"]),

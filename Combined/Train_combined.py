@@ -28,7 +28,7 @@ import json
 import math
 import time
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Dict, Tuple, Optional
 
 import numpy as np
 from PIL import Image
@@ -44,23 +44,26 @@ from Network_endpoint import EndpointNetwork, endpoint_loss_bc1
 
 from Network_color import ColorNetwork, color_loss_bc1
 
-from state_dict_compress import compress_state_dict, print_size_comparison
+from Model_param_compress import compress_state_dict, print_size_comparison
 
 # =========================
 # CONFIG (edit these)
 # =========================
 CONFIG = {
     # Shared paths
-    "endpoint_dataset_json": r"D:\BC1 extract\Bricks090_diffuse\bc1_endpoint_dataset.json",
+    "endpoint_dataset_json": r"D:\BC1 extract\Bricks090_diffuse_2K_test\Train_dataset.json",
     "source_image": r"D:\BC1 extract\Bricks090_diffuse\Bricks090_2K-PNG_Color.png",
 
     # Run toggles
     "run_endpoint_training": True,
     "run_color_training": True,
 
-    # Output folders
-    "out_dir_endpoint": r"D:\BC1 extract\Bricks090_diffuse\runs_endpoint_bc1_steps_compressed",
-    "out_dir_color": r"D:\BC1 extract\Bricks090_diffuse\runs_color_bc1_steps_compressed",
+    # Output folders (single base dir for both)
+    "out_dir_endpoint": r"D:\BC1 extract\Bricks090_diffuse_2K_test\runs_endpoint",
+    "out_dir_color": r"D:\BC1 extract\Bricks090_diffuse_2K_test\runs_color",
+
+    # Merged output (both networks in one file)
+    "out_dir_merged": r"D:\BC1 extract\Bricks090_diffuse_2K_test",
 
     # Training schedule (paper)
     "main_steps": 20_000,
@@ -80,12 +83,10 @@ CONFIG = {
     "qat_bits": 8,
     "freeze_grids_during_qat": True,  # close to "fine-tune MLPs with quantized grids"
 
-    # Data filtering (if you're sticking to 4-color-only mode)
-    "filter_c0_gt_c1": False,
 
     # Batch sizes
-    "batch_size_blocks": 1024,     # endpoint net: blocks per step
-    "batch_size_texels": 65_536,   # color net: texels per step
+    "batch_size_blocks": 2048,     # endpoint net: blocks per step
+    "batch_size_texels": 65536,   # color net: texels per step
 
     # Mixed precision
     "device": "cuda" if torch.cuda.is_available() else "cpu",
@@ -186,25 +187,19 @@ def extract_block_colors_batch_u8(img_hwc_u8_t: torch.Tensor, bxby_batch: torch.
 # =========================
 def load_endpoint_dataset_json(path: Path):
     """
-    Expected schema (from your Endpoints_Extract.py):
+    Expected schema (from Dataset_Extract.py):
       inputs:
-        - st   : (N,2) block coords in [0,1] or normalized
         - bxby : (N,2) block indices
       targets:
         - ep_q01 : (N,6) endpoints in [0,1]
-      flags:
-        - c0_gt_c1 : (N,)
       meta (optional):
         - blocks_x, blocks_y, width, height
     """
     d = json.loads(path.read_text())
-    st = np.asarray(d["inputs"]["st"], dtype=np.float32)
     bxby = np.asarray(d["inputs"]["bxby"], dtype=np.int64)
     ep = np.asarray(d["targets"]["ep_q01"], dtype=np.float32)
-    flags = d.get("flags", {})
-    c0_gt_c1 = np.asarray(flags.get("c0_gt_c1", np.ones((bxby.shape[0],), dtype=np.uint8)), dtype=np.uint8)
     meta = d.get("meta", {})
-    return st, bxby, ep, c0_gt_c1, meta
+    return bxby, ep, meta
 
 
 # =========================
@@ -215,8 +210,8 @@ def train_endpoint_network(cfg: dict, endpoint_dataset_json: Path, source_image:
     use_amp = bool(cfg["use_amp"]) and device.startswith("cuda")
     param_dtype = torch.float16 if cfg["param_dtype"] == "float16" else torch.float32
 
-    st_np, bxby_np, ep_np, c0_gt_c1_np, meta = load_endpoint_dataset_json(endpoint_dataset_json)
-    N = int(st_np.shape[0])
+    bxby_np, ep_np, meta = load_endpoint_dataset_json(endpoint_dataset_json)
+    N = int(bxby_np.shape[0])
 
     blocks_x = int(meta.get("blocks_x", int(bxby_np[:, 0].max() + 1)))
     blocks_y = int(meta.get("blocks_y", int(bxby_np[:, 1].max() + 1)))
@@ -224,20 +219,15 @@ def train_endpoint_network(cfg: dict, endpoint_dataset_json: Path, source_image:
     height = int(meta.get("height", blocks_y * 4))
     print(f"[Endpoint] Dataset: N={N} blocks, blocks=({blocks_x},{blocks_y}), tex={width}x{height}")
 
-    if bool(cfg["filter_c0_gt_c1"]):
-        valid_idx = np.nonzero(c0_gt_c1_np.astype(np.uint8) == 1)[0].astype(np.int64)
-        print(f"[Endpoint] Filtering c0>c1: keeping {valid_idx.size}/{N} blocks")
-    else:
-        valid_idx = np.arange(N, dtype=np.int64)
-
-    if valid_idx.size == 0:
-        raise RuntimeError("[Endpoint] No valid blocks after filtering.")
+    # Compute st from bxby on the fly
+    st_np = np.zeros((N, 2), dtype=np.float32)
+    st_np[:, 0] = bxby_np[:, 0] / max(blocks_x - 1, 1)
+    st_np[:, 1] = bxby_np[:, 1] / max(blocks_y - 1, 1)
 
     # CPU tensors
     st_t = torch.from_numpy(st_np)                       # (N,2) float32 CPU
     bxby_t = torch.from_numpy(bxby_np)                   # (N,2) int64 CPU
     ep_t = torch.from_numpy(ep_np)                       # (N,6) float32 CPU
-    valid_idx_t = torch.from_numpy(valid_idx)            # (M,) int64 CPU
 
     # Reference image (uint8 CPU)
     img_u8 = load_image_rgb_u8(source_image)
@@ -291,8 +281,7 @@ def train_endpoint_network(cfg: dict, endpoint_dataset_json: Path, source_image:
             save_checkpoint(out_dir, f"endpoint_net_bc1_step{step:06d}_qat_start.pt", cfg, meta, net, optimizer, step)
 
         # Sample blocks
-        pos = torch.randint(0, valid_idx_t.numel(), (batch_size,), device="cpu", dtype=torch.long)
-        didx = valid_idx_t[pos]               # (B,) dataset indices on CPU
+        didx = torch.randint(0, N, (batch_size,), device="cpu", dtype=torch.long)
 
         coords = st_t[didx].to(device=device, non_blocking=True)           # (B,2)
         ref_ep = ep_t[didx].to(device=device, non_blocking=True)           # (B,6)
@@ -349,14 +338,12 @@ def train_endpoint_network(cfg: dict, endpoint_dataset_json: Path, source_image:
 
     save_checkpoint(out_dir, "endpoint_net_bc1_final.pt", cfg, meta, net, optimizer, total_steps)
 
-    # Save compressed state dict (grids -> uint8)
+    # Compress state dict (grids -> uint8) and return it (merging happens in main)
     original_sd = net.state_dict()
     compressed_sd = compress_state_dict(original_sd)
-    final_sd = out_dir / "endpoint_net_bc1_final_state_dict_compressed.pt"
-    torch.save(compressed_sd, final_sd)
-    print("[Endpoint] Saved compressed state_dict:", final_sd)
+    print("[Endpoint] Compressed state_dict:")
     print_size_comparison(original_sd, compressed_sd)
-    return final_sd
+    return compressed_sd
 
 
 # =========================
@@ -368,7 +355,7 @@ def train_color_network(cfg: dict, endpoint_dataset_json: Path, source_image: Pa
     param_dtype = torch.float16 if cfg["param_dtype"] == "float16" else torch.float32
 
     # Load endpoint dataset (for bxby + reference endpoints)
-    st_np, bxby_np, ep_np, c0_gt_c1_np, meta = load_endpoint_dataset_json(endpoint_dataset_json)
+    bxby_np, ep_np, meta = load_endpoint_dataset_json(endpoint_dataset_json)
     N = int(bxby_np.shape[0])
 
     blocks_x = int(meta.get("blocks_x", int(bxby_np[:, 0].max() + 1)))
@@ -376,15 +363,6 @@ def train_color_network(cfg: dict, endpoint_dataset_json: Path, source_image: Pa
     width = int(meta.get("width", blocks_x * 4))
     height = int(meta.get("height", blocks_y * 4))
     print(f"[Color] Endpoint dataset: N={N}, blocks=({blocks_x},{blocks_y}), tex={width}x{height}")
-
-    if bool(cfg["filter_c0_gt_c1"]):
-        valid_idx = np.nonzero(c0_gt_c1_np.astype(np.uint8) == 1)[0].astype(np.int64)
-        print(f"[Color] Filtering c0>c1: keeping {valid_idx.size}/{N} blocks")
-    else:
-        valid_idx = np.arange(N, dtype=np.int64)
-
-    if valid_idx.size == 0:
-        raise RuntimeError("[Color] No valid blocks after filtering.")
 
     # Reference image
     img_u8 = load_image_rgb_u8(source_image)
@@ -396,7 +374,6 @@ def train_color_network(cfg: dict, endpoint_dataset_json: Path, source_image: Pa
     img_u8_t = torch.from_numpy(img_u8)                  # (H,W,3) uint8 CPU
     bxby_t = torch.from_numpy(bxby_np.astype(np.int64))  # (N,2) int64 CPU
     ep_t = torch.from_numpy(ep_np.astype(np.float32))    # (N,6) float32 CPU
-    valid_idx_t = torch.from_numpy(valid_idx)            # (M,) int64 CPU
 
     # Model
     # Paper uses finest 2048 for 2K textures; you can change in Network_color if needed.
@@ -445,8 +422,7 @@ def train_color_network(cfg: dict, endpoint_dataset_json: Path, source_image: Pa
             save_checkpoint(out_dir, f"color_net_bc1_step{step:06d}_qat_start.pt", cfg, meta, net, optimizer, step)
 
         # Sample blocks, then a random texel in each 4x4 block
-        pos = torch.randint(0, valid_idx_t.numel(), (batch_size,), device="cpu", dtype=torch.long)
-        didx = valid_idx_t[pos]  # (B,) dataset indices
+        didx = torch.randint(0, N, (batch_size,), device="cpu", dtype=torch.long)
 
         bxby = bxby_t[didx]      # (B,2) CPU
         ref_ep = ep_t[didx]      # (B,6) CPU
@@ -515,19 +491,35 @@ def train_color_network(cfg: dict, endpoint_dataset_json: Path, source_image: Pa
 
     save_checkpoint(out_dir, "color_net_bc1_final.pt", cfg, meta, net, optimizer, total_steps)
 
-    # Save compressed state dict (grids -> uint8)
+    # Compress state dict (grids -> uint8) and return it (merging happens in main)
     original_sd = net.state_dict()
     compressed_sd = compress_state_dict(original_sd)
-    final_sd = out_dir / "color_net_bc1_final_state_dict_compressed.pt"
-    torch.save(compressed_sd, final_sd)
-    print("[Color] Saved compressed state_dict:", final_sd)
+    print("[Color] Compressed state_dict:")
     print_size_comparison(original_sd, compressed_sd)
-    return final_sd
+    return compressed_sd
 
 
 # =========================
 # Main
 # =========================
+def merge_compressed_state_dicts(
+    endpoint_sd: Dict[str, torch.Tensor],
+    color_sd: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """
+    Merge two compressed state dicts into one file.
+
+    Keys are prefixed with 'endpoint.' and 'color.' so they can be
+    cleanly separated at load time.
+    """
+    merged: Dict[str, torch.Tensor] = {}
+    for k, v in endpoint_sd.items():
+        merged["endpoint." + k] = v
+    for k, v in color_sd.items():
+        merged["color." + k] = v
+    return merged
+
+
 def main():
     cfg = CONFIG
     set_seed(int(cfg["seed"]))
@@ -536,6 +528,7 @@ def main():
     source_image = Path(cfg["source_image"]).expanduser().resolve()
     out_dir_ep = Path(cfg["out_dir_endpoint"]).expanduser().resolve()
     out_dir_co = Path(cfg["out_dir_color"]).expanduser().resolve()
+    out_dir_merged = Path(cfg["out_dir_merged"]).expanduser().resolve()
 
     if not endpoint_dataset_json.exists():
         raise FileNotFoundError(f"Endpoint dataset JSON not found: {endpoint_dataset_json}")
@@ -544,18 +537,41 @@ def main():
 
     out_dir_ep.mkdir(parents=True, exist_ok=True)
     out_dir_co.mkdir(parents=True, exist_ok=True)
+    out_dir_merged.mkdir(parents=True, exist_ok=True)
 
     print("Device:", cfg["device"])
     print("AMP:", cfg["use_amp"], "| param_dtype:", cfg["param_dtype"])
     print("Paper schedule:", cfg["main_steps"], "+", int(round(cfg["main_steps"] * cfg["qat_tail_fraction"])), "QAT steps")
 
+    endpoint_compressed_sd = None
+    color_compressed_sd = None
+
     if bool(cfg["run_endpoint_training"]):
         print("\n====================\nTRAIN ENDPOINT NET\n====================")
-        train_endpoint_network(cfg, endpoint_dataset_json, source_image, out_dir_ep)
+        endpoint_compressed_sd = train_endpoint_network(cfg, endpoint_dataset_json, source_image, out_dir_ep)
 
     if bool(cfg["run_color_training"]):
         print("\n====================\nTRAIN COLOR NET\n====================")
-        train_color_network(cfg, endpoint_dataset_json, source_image, out_dir_co)
+        color_compressed_sd = train_color_network(cfg, endpoint_dataset_json, source_image, out_dir_co)
+
+    # Merge both compressed state dicts into one file
+    if endpoint_compressed_sd is not None and color_compressed_sd is not None:
+        merged = merge_compressed_state_dicts(endpoint_compressed_sd, color_compressed_sd)
+        merged_path = out_dir_merged / "ntbc_bc1_merged_compressed.pt"
+        torch.save(merged, merged_path)
+
+        total_bytes = sum(t.numel() * t.element_size() for t in merged.values())
+        print(f"\n[MERGED] Saved both networks into one file: {merged_path}")
+        print(f"[MERGED] Total size: {total_bytes / 1024 / 1024:.2f} MB")
+
+        # Clean up individual run directories now that the merged file exists
+        import shutil
+        for d in (out_dir_ep, out_dir_co):
+            if d.exists():
+                shutil.rmtree(d)
+                print(f"[CLEANUP] Deleted: {d}")
+    else:
+        print("\n[WARN] Skipped merging: both networks must be trained to produce merged file.")
 
 
 if __name__ == "__main__":
