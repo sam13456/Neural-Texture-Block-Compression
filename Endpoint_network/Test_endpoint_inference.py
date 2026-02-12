@@ -14,7 +14,7 @@ from typing import Tuple
 import torch
 
 
-from Network_paper import EndpointNetwork
+from Network import EndpointNetwork
 
 
 DATASET_PATH = r"D:\BC1 extract\Bricks090_diffuse\bc1_endpoint_dataset.json"

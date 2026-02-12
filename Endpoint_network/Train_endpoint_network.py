@@ -22,7 +22,7 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 
-from Network_paper import EndpointNetwork, endpoint_loss_bc1
+from Network_endpoint import EndpointNetwork, endpoint_loss_bc1
 
 CONFIG = {
     # >>> EDIT THESE PATHS <<<
