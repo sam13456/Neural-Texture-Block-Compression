@@ -1,16 +1,15 @@
 """
-NTBC Color Network for BC1 compression.
-Based on: Neural Texture Block Compression (arXiv:2407.09543v2)
+NTBC Color Network for BC1 compression (multi-RGB-texture capable).
+Based on: Neural Texture Block Compression (arXiv:2407.09543)
 
-- Multi-resolution feature grids + small MLP to predict uncompressed colors from (u,v).
-- Includes the paper's color-network training loss: L_color = L_c + L_cd
+What changed vs your original:
+- Supports training a *single* color model that predicts colors for multiple RGB textures jointly.
+- If num_textures=T, the network outputs (3*T) values per texel:
+    [r,g,b] repeated T times (each in [0,1]).
+- Provides color_loss_bc1_multi(...) which loops over textures and averages losses.
 
-Paper references:
-- Distances and index: Eq. 9–10
-- Losses: Eq. 12
-- STE + softmax temperature: Eq. 13, Sec. 3.2
-- Grid config and optimizer schedule: Sec. 3.4
-- Grid QAT: Sec. 3.3
+Backwards compatible:
+- num_textures defaults to 1, so your single-texture pipeline still works.
 """
 
 from __future__ import annotations
@@ -47,31 +46,39 @@ def _fake_quantize_asymmetric_with_range(
 
 # ---------- BC1 helpers ----------
 
-# Eq. 7 weights for 4-color BC1 palette (paper assumes no 1-bit alpha focus)
 _BC1_W = torch.tensor([0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0], dtype=torch.float32)
 
 
 def clamp_coords01(coords: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Clamp normalized coords to [0, 1-eps] to avoid edge indexing issues at exactly 1.0."""
     return coords.clamp(0.0, 1.0 - eps)
 
 
 def endpoints6_to_e0e1(endpoints6: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    endpoints6: (B,6) = [r0,g0,b0,r1,g1,b1] in [0,1]
-    returns e0,e1: (B,3), (B,3)
-    """
-    e0 = endpoints6[:, 0:3]
-    e1 = endpoints6[:, 3:6]
+    e0 = endpoints6[..., 0:3]
+    e1 = endpoints6[..., 3:6]
     return e0, e1
 
 
 def bc1_palette_from_endpoints(e0: torch.Tensor, e1: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """Builds BC1 palette colors from endpoints using linear interpolation (Eq. 7)."""
-    wv = w.view(1, -1, 1).to(device=e0.device, dtype=e0.dtype)  # (1,4,1)
-    e0v = e0.unsqueeze(1)  # (B,1,3)
-    e1v = e1.unsqueeze(1)  # (B,1,3)
-    return (1.0 - wv) * e0v + wv * e1v  # (B,4,3)
+    wv = w.view(*([1] * (e0.ndim - 1)), -1, 1).to(device=e0.device, dtype=e0.dtype)
+    e0v = e0.unsqueeze(-2)
+    e1v = e1.unsqueeze(-2)
+    return (1.0 - wv) * e0v + wv * e1v  # (...,4,3)
+
+
+def _infer_num_textures_from_flat_colors(colors_flat: torch.Tensor) -> int:
+    if colors_flat.ndim != 2:
+        raise ValueError(f"colors_flat must be (B, 3*T). Got {tuple(colors_flat.shape)}")
+    D = int(colors_flat.shape[1])
+    if D % 3 != 0:
+        raise ValueError(f"Color dimension must be multiple of 3. Got {D}")
+    return D // 3
+
+
+def split_colors_flat(colors_flat: torch.Tensor) -> torch.Tensor:
+    """(B,3*T) -> (B,T,3)"""
+    T = _infer_num_textures_from_flat_colors(colors_flat)
+    return colors_flat.view(colors_flat.shape[0], T, 3)
 
 
 # ---------- Multi-resolution Feature Grids ----------
@@ -81,11 +88,11 @@ class MultiResFeatureGrid2D(nn.Module):
 
     def __init__(
         self,
-        num_levels: int = 8,          # paper: 8 levels for texture coords (Sec. 3.4)
-        base_resolution: int = 16,    # paper: coarsest 16
-        finest_resolution: int = 2048,# paper: finest 2048 for texture coords (Sec. 3.4)
-        feature_dim: int = 2,         # paper: 2D features per level
-        init_range: float = 1e-4,     # paper: [-1e-4, 1e-4]
+        num_levels: int = 8,
+        base_resolution: int = 16,
+        finest_resolution: int = 2048,
+        feature_dim: int = 2,
+        init_range: float = 1e-4,
         param_dtype: torch.dtype = torch.float16,
     ):
         super().__init__()
@@ -118,9 +125,8 @@ class MultiResFeatureGrid2D(nn.Module):
             grids.append(g)
 
         self.grids = nn.ParameterList(grids)
-        self.output_dim = self.num_levels * self.feature_dim  # paper: 16D for color net
+        self.output_dim = self.num_levels * self.feature_dim
 
-        # QAT state
         self.qat_enabled = False
         self.qat_bits = 8
 
@@ -136,10 +142,6 @@ class MultiResFeatureGrid2D(nn.Module):
         return list(self._resolutions)
 
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
-        """
-        coords: (B,2) in [0,1]
-        returns: (B, num_levels*feature_dim)
-        """
         if coords.ndim != 2 or coords.shape[1] != 2:
             raise ValueError(f"coords must be (B,2), got {tuple(coords.shape)}")
 
@@ -197,18 +199,23 @@ class MultiResFeatureGrid2D(nn.Module):
 
 class ColorNetwork(nn.Module):
     """
-    Predicts uncompressed RGB color c_hat from 2D texture coordinates (u,v).
-    Paper: 8-level grids (finest 2048), then 3-hidden-layer MLP (64 neurons) with selu, sigmoid output.
+    Predicts uncompressed RGB color(s) c_hat from 2D texture coordinates (u,v).
+    If num_textures=T, outputs (B, 3*T) with a sigmoid.
     """
 
     def __init__(
         self,
+        num_textures: int = 1,
         param_dtype: torch.dtype = torch.float32,
         finest_resolution: int = 2048,
         base_resolution: int = 16,
         num_levels: int = 8,
     ):
         super().__init__()
+        if num_textures < 1:
+            raise ValueError("num_textures must be >= 1")
+        self.num_textures = int(num_textures)
+
         self.encoding = MultiResFeatureGrid2D(
             num_levels=int(num_levels),
             base_resolution=int(base_resolution),
@@ -217,7 +224,9 @@ class ColorNetwork(nn.Module):
             init_range=1e-4,
             param_dtype=(torch.float16 if param_dtype == torch.float16 else torch.float32),
         )
-        in_dim = self.encoding.output_dim  # 16
+        in_dim = self.encoding.output_dim
+
+        out_dim = 3 * self.num_textures
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, 64),
             nn.SELU(inplace=True),
@@ -225,7 +234,7 @@ class ColorNetwork(nn.Module):
             nn.SELU(inplace=True),
             nn.Linear(64, 64),
             nn.SELU(inplace=True),
-            nn.Linear(64, 3),
+            nn.Linear(64, out_dim),
             nn.Sigmoid(),
         )
         for m in self.mlp:
@@ -236,7 +245,6 @@ class ColorNetwork(nn.Module):
 
     def forward(self, uv: torch.Tensor) -> torch.Tensor:
         feats = self.encoding(uv)
-        # MLP in float32 for stability even if grids are fp16
         out = self.mlp(feats.to(torch.float32))
         return out
 
@@ -246,7 +254,7 @@ class ColorLossOutput:
     total: torch.Tensor
     lc: torch.Tensor
     lcd: torch.Tensor
-    hard_indices: torch.Tensor  # (B,) uint8
+    hard_indices: torch.Tensor  # (B,) for single, (B,T) for multi
 
 
 def color_loss_bc1(
@@ -256,14 +264,6 @@ def color_loss_bc1(
     temperature: float = 0.01,
     reduction: str = "mean",
 ) -> ColorLossOutput:
-    """
-    Paper Eq. 12: L_color = L_c + L_cd
-
-    - L_c: MSE(pred_color, ref_color)
-    - L_cd: decode using reference endpoints and STE-based discrete index selection
-            where d_n = -||pred_color - c_n||  (Eq. 9 for color network),
-            n = argmax(d_n) (Eq. 10)
-    """
     if pred_color.shape != ref_color.shape:
         raise ValueError(f"pred/ref colors must have same shape, got {pred_color.shape} vs {ref_color.shape}")
     if pred_color.ndim != 2 or pred_color.shape[1] != 3:
@@ -293,9 +293,94 @@ def color_loss_bc1(
     w_soft = (p * w_levels.view(1, 4)).sum(dim=-1)  # (B,)
     decoded_soft = (1.0 - w_soft).unsqueeze(-1) * ref_e0 + w_soft.unsqueeze(-1) * ref_e1  # (B,3)
 
-    # Straight-through estimator: forward uses hard, gradients flow through soft
     decoded = decoded_hard + (decoded_soft - decoded_soft.detach())
 
     lcd = F.mse_loss(decoded, ref_color, reduction=reduction)
     total = lc + lcd
     return ColorLossOutput(total=total, lc=lc, lcd=lcd, hard_indices=hard_n)
+
+
+def color_loss_bc1_multi(
+    pred_colors: torch.Tensor,      # (B,3*T) or (B,T,3)
+    ref_colors: torch.Tensor,       # (B,3*T) or (B,T,3)
+    ref_endpoints: torch.Tensor,    # (B,6*T) or (B,T,6)
+    temperature: float = 0.01,
+    reduction: str = "mean",
+) -> ColorLossOutput:
+    """
+    Multi-texture color loss: average over textures of (L_c + L_cd).
+
+    Shapes:
+      pred_colors  : (B,3*T) or (B,T,3)
+      ref_colors   : (B,3*T) or (B,T,3)
+      ref_endpoints: (B,6*T) or (B,T,6)
+    """
+    if pred_colors.ndim == 2:
+        pred_c = split_colors_flat(pred_colors)  # (B,T,3)
+    elif pred_colors.ndim == 3 and pred_colors.shape[-1] == 3:
+        pred_c = pred_colors
+    else:
+        raise ValueError(f"pred_colors must be (B,3*T) or (B,T,3). Got {tuple(pred_colors.shape)}")
+
+    if ref_colors.ndim == 2:
+        ref_c = split_colors_flat(ref_colors)
+    elif ref_colors.ndim == 3 and ref_colors.shape[-1] == 3:
+        ref_c = ref_colors
+    else:
+        raise ValueError(f"ref_colors must be (B,3*T) or (B,T,3). Got {tuple(ref_colors.shape)}")
+
+    if ref_endpoints.ndim == 2:
+        # (B,6*T) -> (B,T,6)
+        D = int(ref_endpoints.shape[1])
+        if D % 6 != 0:
+            raise ValueError(f"ref_endpoints second dim must be multiple of 6. Got {D}")
+        T = D // 6
+        ref_e = ref_endpoints.view(ref_endpoints.shape[0], T, 6)
+    elif ref_endpoints.ndim == 3 and ref_endpoints.shape[-1] == 6:
+        ref_e = ref_endpoints
+    else:
+        raise ValueError(f"ref_endpoints must be (B,6*T) or (B,T,6). Got {tuple(ref_endpoints.shape)}")
+
+    B, T, _ = pred_c.shape
+    if ref_c.shape[:2] != (B, T):
+        raise ValueError(f"pred/ref colors mismatch: {tuple(pred_c.shape)} vs {tuple(ref_c.shape)}")
+    if ref_e.shape[:2] != (B, T):
+        raise ValueError(f"ref_endpoints mismatch: expected (B,T,6), got {tuple(ref_e.shape)}")
+
+    totals, lcs, lcds, hards = [], [], [], []
+    for t in range(T):
+        out_t = color_loss_bc1(
+            pred_c[:, t, :],
+            ref_c[:, t, :],
+            ref_e[:, t, :],
+            temperature=temperature,
+            reduction=reduction,
+        )
+        totals.append(out_t.total)
+        lcs.append(out_t.lc)
+        lcds.append(out_t.lcd)
+        hards.append(out_t.hard_indices)
+
+    total = torch.stack(totals).mean()
+    lc = torch.stack(lcs).mean()
+    lcd = torch.stack(lcds).mean()
+    hard_indices = torch.stack(hards, dim=1)  # (B,T)
+    return ColorLossOutput(total=total, lc=lc, lcd=lcd, hard_indices=hard_indices)
+
+
+if __name__ == "__main__":
+    print("Quick test: multi-texture ColorNetwork forward + loss shapes")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    T = 3
+    net = ColorNetwork(num_textures=T).to(device)
+
+    B = 32
+    uv = torch.rand(B, 2, device=device)
+    pred = net(uv)  # (B,3*T)
+
+    ref_c = torch.rand(B, 3*T, device=device)
+    ref_ep = torch.rand(B, 6*T, device=device)
+
+    out = color_loss_bc1_multi(pred, ref_c, ref_ep)
+    print("pred:", pred.shape)
+    print("loss:", out.total.item(), "lc:", out.lc.item(), "lcd:", out.lcd.item(), "indices:", out.hard_indices.shape)

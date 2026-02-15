@@ -1,9 +1,15 @@
 """
-NTBC Endpoint Network for BC1 compression.
-Based on: Neural Texture Block Compression (arXiv:2407.09543v2)
+NTBC Endpoint Network for BC1 compression (multi-RGB-texture capable).
+Based on: Neural Texture Block Compression (arXiv:2407.09543)
 
-Multi-resolution feature grids + MLP to predict BC1 endpoints from 2D block coordinates.
-Includes the paper's endpoint training loss (L_e + L_cd).
+What changed vs your original:
+- Supports training a *single* endpoint model that predicts endpoints for multiple RGB textures jointly.
+- If num_textures=T, the network outputs (6*T) values per block:
+    [r0,g0,b0,r1,g1,b1] repeated T times (each in [0,1]).
+- Provides endpoint_loss_bc1_multi(...) which loops over textures and averages losses.
+
+Backwards compatible:
+- num_textures defaults to 1, so existing single-texture training still works.
 """
 
 from __future__ import annotations
@@ -51,24 +57,26 @@ def clamp_coords01(coords: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 def endpoints6_to_e0e1(endpoints6: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    endpoints6: (B,6) = [r0,g0,b0,r1,g1,b1] in [0,1]
-    returns e0,e1: (B,3), (B,3)
+    endpoints6: (...,6) = [r0,g0,b0,r1,g1,b1] in [0,1]
+    returns e0,e1: (...,3), (...,3)
     """
-    e0 = endpoints6[:, 0:3]
-    e1 = endpoints6[:, 3:6]
+    e0 = endpoints6[..., 0:3]
+    e1 = endpoints6[..., 3:6]
     return e0, e1
 
 
 def bc1_palette_from_endpoints(e0: torch.Tensor, e1: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """Builds BC1 palette colors from endpoints using linear interpolation."""
-    wv = w.view(1, -1, 1).to(device=e0.device, dtype=e0.dtype)
-    e0v = e0.unsqueeze(1)
-    e1v = e1.unsqueeze(1)
+    # expects e0/e1: (...,3), w: (4,)
+    # returns palette: (...,4,3)
+    wv = w.view(*([1] * (e0.ndim - 1)), -1, 1).to(device=e0.device, dtype=e0.dtype)
+    e0v = e0.unsqueeze(-2)
+    e1v = e1.unsqueeze(-2)
     return (1.0 - wv) * e0v + wv * e1v
 
 
 def pack_rgb565_from_epq01(endpoints6: torch.Tensor) -> torch.Tensor:
-    """Converts predicted endpoints to packed RGB565 format."""
+    """Converts predicted endpoints to packed RGB565 format. endpoints6: (B,6) -> (B,2) uint16"""
     r0 = (endpoints6[:, 0] * 31.0).round().clamp(0, 31).to(torch.int32)
     g0 = (endpoints6[:, 1] * 63.0).round().clamp(0, 63).to(torch.int32)
     b0 = (endpoints6[:, 2] * 31.0).round().clamp(0, 31).to(torch.int32)
@@ -80,6 +88,21 @@ def pack_rgb565_from_epq01(endpoints6: torch.Tensor) -> torch.Tensor:
     c1 = (r1 << 11) | (g1 << 5) | b1
     out = torch.stack([c0, c1], dim=1).to(torch.uint16)
     return out
+
+
+def _infer_num_textures_from_flat(endpoints_flat: torch.Tensor) -> int:
+    if endpoints_flat.ndim != 2:
+        raise ValueError(f"endpoints_flat must be (B, 6*T). Got {tuple(endpoints_flat.shape)}")
+    D = int(endpoints_flat.shape[1])
+    if D % 6 != 0:
+        raise ValueError(f"Endpoint dimension must be multiple of 6. Got {D}")
+    return D // 6
+
+
+def split_endpoints_flat(endpoints_flat: torch.Tensor) -> torch.Tensor:
+    """(B,6*T) -> (B,T,6)"""
+    T = _infer_num_textures_from_flat(endpoints_flat)
+    return endpoints_flat.view(endpoints_flat.shape[0], T, 6)
 
 
 # ---------- Multi-resolution Feature Grids  ----------
@@ -151,7 +174,6 @@ class MultiResFeatureGrid2D(nn.Module):
             raise ValueError(f"coords must be (B,2), got {tuple(coords.shape)}")
 
         coords = clamp_coords01(coords).to(dtype=torch.float32)
-        B = coords.shape[0]
         feats = []
 
         x = coords[:, 0]
@@ -209,6 +231,7 @@ class EndpointNetwork(nn.Module):
 
     def __init__(
         self,
+        num_textures: int = 1,
         num_levels: int = 7,
         base_resolution: int = 16,
         finest_resolution: int = 1024,
@@ -219,6 +242,10 @@ class EndpointNetwork(nn.Module):
     ):
         super().__init__()
 
+        if num_textures < 1:
+            raise ValueError("num_textures must be >= 1")
+        self.num_textures = int(num_textures)
+
         self.encoding = MultiResFeatureGrid2D(
             num_levels=num_levels,
             base_resolution=base_resolution,
@@ -228,12 +255,14 @@ class EndpointNetwork(nn.Module):
             param_dtype=param_dtype,
         )
 
+        out_dim = 6 * self.num_textures
+
         layers = []
         in_dim = self.encoding.output_dim
         for i in range(num_hidden_layers):
             layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
             layers.append(nn.SELU())
-        layers.append(nn.Linear(hidden_dim, 6))
+        layers.append(nn.Linear(hidden_dim, out_dim))
         layers.append(nn.Sigmoid())
         self.mlp = nn.Sequential(*layers)
 
@@ -257,9 +286,20 @@ class EndpointNetwork(nn.Module):
 
     @torch.no_grad()
     def predict_rgb565(self, coords: torch.Tensor) -> torch.Tensor:
-        """Predicts and quantizes endpoints to RGB565 format."""
-        ep = self.forward(coords)
-        return pack_rgb565_from_epq01(ep)
+        """
+        Predicts and quantizes endpoints to RGB565 format.
+        Returns:
+          - if num_textures==1: (B,2) uint16
+          - else:              (B,T,2) uint16
+        """
+        ep_flat = self.forward(coords)  # (B,6*T)
+        if self.num_textures == 1:
+            return pack_rgb565_from_epq01(ep_flat)
+        ep = ep_flat.view(ep_flat.shape[0], self.num_textures, 6)
+        outs = []
+        for t in range(self.num_textures):
+            outs.append(pack_rgb565_from_epq01(ep[:, t, :]))
+        return torch.stack(outs, dim=1)
 
 
 # ---------- Paper-aligned endpoint loss (L_e + L_cd) ----------
@@ -269,7 +309,7 @@ class EndpointLossOutput:
     total: torch.Tensor
     le: torch.Tensor
     lcd: torch.Tensor
-    hard_indices: torch.Tensor  
+    hard_indices: torch.Tensor  # (B,16) for single, (B,T,16) for multi
 
 
 def endpoint_loss_bc1(
@@ -281,7 +321,7 @@ def endpoint_loss_bc1(
 ) -> EndpointLossOutput:
     """
     Computes endpoint training loss: L_e + L_cd.
-    
+
     Uses straight-through estimator for gradient flow through argmax.
     """
     if pred_endpoints6.shape != ref_endpoints6.shape:
@@ -295,14 +335,14 @@ def endpoint_loss_bc1(
     # Build palette from predicted endpoints (for distance computation)
     pred_e0, pred_e1 = endpoints6_to_e0e1(pred_endpoints6)
     w = _BC1_W.to(device=pred_endpoints6.device, dtype=pred_endpoints6.dtype)
-    pal_pred = bc1_palette_from_endpoints(pred_e0, pred_e1, w=w)
+    pal_pred = bc1_palette_from_endpoints(pred_e0, pred_e1, w=w)  # (B,4,3)
 
     # Distances d_n = -||c - c_hat_n||  (Eq. 9)
     # (B,16,4)
     diff = ref_colors.unsqueeze(2) - pal_pred.unsqueeze(1)
     dn = -torch.sqrt((diff * diff).sum(dim=-1) + 1e-12)
 
-    hard_n = torch.argmax(dn, dim=-1).to(torch.uint8)
+    hard_n = torch.argmax(dn, dim=-1).to(torch.uint8)  # (B,16)
 
     # Decode with reference endpoints using Eq.7 (paper says use reference endpoints for final decoded colors)
     ref_e0, ref_e1 = endpoints6_to_e0e1(ref_endpoints6)
@@ -323,19 +363,83 @@ def endpoint_loss_bc1(
     return EndpointLossOutput(total=total, le=le, lcd=lcd, hard_indices=hard_n)
 
 
+def endpoint_loss_bc1_multi(
+    pred_endpoints: torch.Tensor,   # (B,6*T) or (B,T,6)
+    ref_endpoints: torch.Tensor,    # (B,6*T) or (B,T,6)
+    ref_colors: torch.Tensor,       # (B,T,16,3)  (or (B,16,3) if T=1)
+    temperature: float = 0.01,
+    reduction: str = "mean",
+) -> EndpointLossOutput:
+    """
+    Multi-texture version of endpoint loss.
+    We compute the paper loss per texture and average across textures (keeps scale stable vs T).
+
+    Shapes:
+      pred_endpoints: (B,6*T) or (B,T,6)
+      ref_endpoints : (B,6*T) or (B,T,6)
+      ref_colors    : (B,T,16,3) or (B,16,3) when T=1
+    """
+    if pred_endpoints.ndim == 2:
+        pred_e = split_endpoints_flat(pred_endpoints)  # (B,T,6)
+    elif pred_endpoints.ndim == 3 and pred_endpoints.shape[-1] == 6:
+        pred_e = pred_endpoints
+    else:
+        raise ValueError(f"pred_endpoints must be (B,6*T) or (B,T,6). Got {tuple(pred_endpoints.shape)}")
+
+    if ref_endpoints.ndim == 2:
+        ref_e = split_endpoints_flat(ref_endpoints)
+    elif ref_endpoints.ndim == 3 and ref_endpoints.shape[-1] == 6:
+        ref_e = ref_endpoints
+    else:
+        raise ValueError(f"ref_endpoints must be (B,6*T) or (B,T,6). Got {tuple(ref_endpoints.shape)}")
+
+    B, T, _ = pred_e.shape
+    if ref_e.shape[:2] != (B, T):
+        raise ValueError(f"pred/ref endpoints mismatch: {tuple(pred_e.shape)} vs {tuple(ref_e.shape)}")
+
+    if T == 1 and ref_colors.ndim == 3:
+        ref_c = ref_colors.unsqueeze(1)  # (B,1,16,3)
+    elif ref_colors.ndim == 4 and ref_colors.shape[1] == T:
+        ref_c = ref_colors
+    else:
+        raise ValueError(f"ref_colors must be (B,T,16,3) (or (B,16,3) when T=1). Got {tuple(ref_colors.shape)}")
+
+    totals, les, lcds, hards = [], [], [], []
+    for t in range(T):
+        out_t = endpoint_loss_bc1(
+            pred_e[:, t, :],
+            ref_e[:, t, :],
+            ref_c[:, t, :, :],
+            temperature=temperature,
+            reduction=reduction,
+        )
+        totals.append(out_t.total)
+        les.append(out_t.le)
+        lcds.append(out_t.lcd)
+        hards.append(out_t.hard_indices)
+
+    # Average across textures to keep magnitude comparable to single-texture case
+    total = torch.stack(totals).mean()
+    le = torch.stack(les).mean()
+    lcd = torch.stack(lcds).mean()
+    hard_indices = torch.stack(hards, dim=1)  # (B,T,16)
+    return EndpointLossOutput(total=total, le=le, lcd=lcd, hard_indices=hard_indices)
+
+
 if __name__ == "__main__":
-    print("Quick test: EndpointNetwork forward + loss shapes")
+    print("Quick test: multi-texture EndpointNetwork forward + loss shapes")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    net = EndpointNetwork(param_dtype=torch.float16 if device == "cuda" else torch.float32).to(device)
+    T = 3
+    net = EndpointNetwork(num_textures=T, param_dtype=torch.float16 if device == "cuda" else torch.float32).to(device)
 
     B = 8
     coords = torch.rand(B, 2, device=device)
-    pred = net(coords)
+    pred = net(coords)  # (B,6*T)
 
-    ref_ep = torch.rand(B, 6, device=device)
-    ref_colors = torch.rand(B, 16, 3, device=device)
+    ref_ep = torch.rand(B, 6*T, device=device)
+    ref_colors = torch.rand(B, T, 16, 3, device=device)
 
-    out = endpoint_loss_bc1(pred, ref_ep, ref_colors)
+    out = endpoint_loss_bc1_multi(pred, ref_ep, ref_colors)
     print("pred:", pred.shape, pred.min().item(), pred.max().item())
     print("loss:", out.total.item(), "le:", out.le.item(), "lcd:", out.lcd.item(), "indices:", out.hard_indices.shape)
