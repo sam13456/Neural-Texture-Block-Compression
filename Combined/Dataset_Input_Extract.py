@@ -14,11 +14,8 @@ Outputs:
     targets.ep_q01: [ [e0.rgb, e1.rgb] concatenated per texture ] in Q01 float
         shape per block = 6 * num_textures
 - Inference_input.json:
-    blocks_x, blocks_y, width, height, num_textures, texture_names
-
-Notes:
-- This script only builds the *endpoint* dataset. The color network training additionally
-  needs the uncompressed source images, and optionally other per-texel derived data.
+    blocks_x, blocks_y, num_textures, texture_names
+    
 """
 
 from __future__ import annotations
@@ -35,30 +32,17 @@ DXGI_FORMAT_BC1_UNORM_SRGB = 72
 
 
 # =========================
-# CONFIG (edit these)
+# CONFIG (paths from config.py)
 # =========================
+from config import (
+    COMPRESSONATOR_CLI, SOURCE_IMAGES, TEXTURE_NAMES, MODEL_DIR,
+)
+
 CONFIG: Dict[str, Any] = {
-    "cli": r"D:\Compressonatorcli\bin\CLI\compressonatorcli.exe",
-
-    # ---- SINGLE TEXTURE (legacy) ----
-    # If you keep only "source_image", the script behaves like before.
-    #"source_image": r"D:\BC1 extract\Bricks090_4K-PNG\Bricks090_4K-PNG_Color.png",
-
-    # ---- MULTI TEXTURE (new) ----
-    # If you set "source_images" to a non-empty list, it overrides "source_image".
-    # All textures must have the SAME resolution.
-    # Example:
-    # "source_images": [
-    #     r"D:\mat\albedo.png",
-    #     r"D:\mat\normal_rgb.png",
-    #     r"D:\mat\orm_rgb.png",
-    # ],
-    "source_images": [r"D:\BC1 extract\Bricks090_4K-PNG\Bricks090_4K-PNG_Color.png", r"D:\BC1 extract\Bricks090_4K-PNG\Bricks090_4K-PNG_NormalDX.png", r"D:\BC1 extract\Bricks090_4K-PNG\Bricks090_4K-PNG_NormalGL.png"],
-
-    # Optional explicit names matching source_images length (otherwise uses file stems)
-    "texture_names": ["Color", "NormalDX", "NormalGL"],
-
-    "out_dir": r"D:\BC1 extract\Bricks090_4K_test",
+    "cli": COMPRESSONATOR_CLI,
+    "source_images": SOURCE_IMAGES,
+    "texture_names": TEXTURE_NAMES,
+    "out_dir": MODEL_DIR,
     "encode_with": "HPC",
     "refine_steps": 2,
     "include_meta": False,
@@ -182,28 +166,15 @@ def parse_dds_bc1_endpoints(dds_path: Path) -> Dict[str, Any]:
 
 def _ensure_source_images(cfg: Dict[str, Any]) -> Tuple[List[str], List[str]]:
     """Return (source_images, texture_names) with sane defaults."""
-    srcs: List[str] = []
-    if cfg.get("source_images"):
-        srcs = list(cfg["source_images"])
-    else:
-        # legacy single
-        si = cfg.get("source_image")
-        if si:
-            srcs = [si]
-
+    srcs = list(cfg.get("source_images") or [])
     if not srcs:
-        raise ValueError("No input images. Provide CONFIG['source_image'] or CONFIG['source_images'].")
+        raise ValueError("No input images. Provide CONFIG['source_images'].")
 
-    # Names
     names_cfg = list(cfg.get("texture_names") or [])
     if names_cfg and len(names_cfg) != len(srcs):
         raise ValueError("CONFIG['texture_names'] length must match CONFIG['source_images'].")
 
-    if names_cfg:
-        names = names_cfg
-    else:
-        names = [Path(s).stem for s in srcs]
-
+    names = names_cfg if names_cfg else [Path(s).stem for s in srcs]
     return srcs, names
 
 
@@ -276,20 +247,6 @@ def get_reference_endpoints_bc1_multi(
     return refs, metas, dds_paths
 
 
-def convert_reference_to_dataset(
-    ref: Dict[str, Any],
-    out_json: Path,
-    source_image: Optional[str] = None,
-    include_meta: bool = True,
-) -> None:
-    """Legacy: single ref -> endpoint dataset (same schema as before)."""
-    convert_reference_to_dataset_multi(
-        refs=[ref],
-        out_json=out_json,
-        source_images=[source_image] if source_image else None,
-        texture_names=None,
-        include_meta=include_meta,
-    )
 
 
 def convert_reference_to_dataset_multi(
@@ -372,8 +329,6 @@ def convert_reference_to_dataset_multi(
     # Inference helper (lets inference know how to split outputs back to textures)
     coords_json = out_json.parent / "Inference_input.json"
     coords_payload = {
-        "width": W,
-        "height": H,
         "blocks_x": Bx,
         "blocks_y": By,
         "num_textures": num_textures,
@@ -391,33 +346,18 @@ if __name__ == "__main__":
     out_dir = Path(cfg["out_dir"]).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Multi path (also covers single, but we keep legacy prints readable)
-    if len(src_images) == 1:
-        ref, ref_meta, out_dds = get_reference_endpoints_bc1(
-            cfg["cli"], src_images[0], str(out_dir),
-            encode_with=cfg["encode_with"], refine_steps=cfg["refine_steps"],
-        )
-        print("DDS written to:", out_dds)
+    refs, metas, dds_paths = get_reference_endpoints_bc1_multi(
+        cfg["cli"], src_images, str(out_dir),
+        encode_with=cfg["encode_with"], refine_steps=cfg["refine_steps"],
+    )
+    print("DDS written to:")
+    for d in dds_paths:
+        print(" ", d)
 
-        convert_reference_to_dataset(
-            ref=ref,
-            out_json=out_dir / "Train_dataset.json",
-            source_image=src_images[0],
-            include_meta=cfg["include_meta"],
-        )
-    else:
-        refs, metas, dds_paths = get_reference_endpoints_bc1_multi(
-            cfg["cli"], src_images, str(out_dir),
-            encode_with=cfg["encode_with"], refine_steps=cfg["refine_steps"],
-        )
-        print("DDS written to:")
-        for d in dds_paths:
-            print("  ", d)
-
-        convert_reference_to_dataset_multi(
-            refs=refs,
-            out_json=out_dir / "Train_dataset.json",
-            source_images=src_images,
-            texture_names=tex_names,
-            include_meta=cfg["include_meta"],
-        )
+    convert_reference_to_dataset_multi(
+        refs=refs,
+        out_json=out_dir / "Train_dataset.json",
+        source_images=src_images,
+        texture_names=tex_names,
+        include_meta=cfg["include_meta"],
+    )

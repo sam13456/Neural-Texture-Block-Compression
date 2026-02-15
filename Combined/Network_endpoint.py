@@ -8,8 +8,6 @@ What changed vs your original:
     [r0,g0,b0,r1,g1,b1] repeated T times (each in [0,1]).
 - Provides endpoint_loss_bc1_multi(...) which loops over textures and averages losses.
 
-Backwards compatible:
-- num_textures defaults to 1, so existing single-texture training still works.
 """
 
 from __future__ import annotations

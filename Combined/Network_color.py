@@ -8,8 +8,6 @@ What changed vs your original:
     [r,g,b] repeated T times (each in [0,1]).
 - Provides color_loss_bc1_multi(...) which loops over textures and averages losses.
 
-Backwards compatible:
-- num_textures defaults to 1, so your single-texture pipeline still works.
 """
 
 from __future__ import annotations

@@ -8,9 +8,9 @@ This matches the paper's "train one model per material with multiple RGB texture
 Then at inference we split outputs and write separate BC1 DDS files.
 
 Inputs:
-- Inference_input.json (written by Dataset_Input_Extract_v2.py)
-    { blocks_x, blocks_y, width, height, num_textures, texture_names }
-- ntbc_bc1_merged_compressed.pt (written by Train_combined_v2.py)
+- Inference_input.json (written by Dataset_Input_Extract.py)
+    { blocks_x, blocks_y, num_textures, texture_names }
+- ntbc_bc1_merged_compressed.pt (written by Train_combined.py)
 
 Outputs:
 - For T==1: exactly CONFIG['out_dds'] (same as your old script)
@@ -37,34 +37,33 @@ from PIL import Image
 
 import torch
 
-from Network_endpoint_v2 import EndpointNetwork, pack_rgb565_from_epq01, bc1_palette_from_endpoints, _BC1_W
-from Network_color_v2 import ColorNetwork
+from Network_endpoint import EndpointNetwork, pack_rgb565_from_epq01, bc1_palette_from_endpoints, _BC1_W
+from Network_color import ColorNetwork
 
 from Model_param_compress import decompress_state_dict
 
 
 # =========================
-# CONFIG (edit these)
+# CONFIG (paths from config.py)
 # =========================
+from config import (
+    INFERENCE_INPUT_JSON, MERGED_CHECKPOINT, OUT_DDS, OUT_PREVIEW_PNG,
+    REF_DDS, INFERENCE_OUTPUT_DIR,
+)
+
 CONFIG = {
-    # Written by Dataset_Input_Extract_v2.py
-    "coords_json": r"D:\BC1 extract\Bricks090_4K_test\Inference_input.json",
-
-    # Written by Train_combined_v2.py
-    "merged_ckpt": r"D:\BC1 extract\Bricks090_4K-PNG_model\ntbc_bc1_merged_compressed.pt",
-
-    # Output DDS path (DXT1 / BC1). If multiple textures, suffixes will be added.
-    "out_dds": r"D:\BC1 extract\Bricks090_4K-PNG_model\ntbc_out.dds",
-
-    # Optional preview PNG(s)
+    "coords_json": INFERENCE_INPUT_JSON,
+    "merged_ckpt": MERGED_CHECKPOINT,
+    "out_dds": OUT_DDS,
     "save_preview_png": True,
-    "out_preview_png": r"D:\BC1 extract\Bricks090_4K_test\ntbc_out_preview.png",
+    "out_preview_png": OUT_PREVIEW_PNG,
+    "ref_dds": REF_DDS,
+    "inference_output_dir": INFERENCE_OUTPUT_DIR,
 
     # Runtime
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "use_amp": True,
     "block_batch": 65536,
-    "pause_on_exit": False,
 }
 
 
@@ -466,8 +465,78 @@ def infer_ntbc_bc1_to_dds_multi(
                         out_dds_paths=out_dds_paths, out_png_paths=out_png_written)
 
 
+# =========================
+# DDS BC1 decoder (for generating ref PNGs)
+# =========================
+def _rgb565_to_rgb888_np(c_u16: np.ndarray) -> np.ndarray:
+    c = c_u16.astype(np.uint16)
+    r = ((c >> 11) & 31).astype(np.float32) * (255.0 / 31.0)
+    g = ((c >> 5) & 63).astype(np.float32) * (255.0 / 63.0)
+    b = (c & 31).astype(np.float32) * (255.0 / 31.0)
+    rgb = np.stack([r, g, b], axis=-1)
+    return np.clip(np.rint(rgb), 0, 255).astype(np.uint8)
+
+
+def decode_dds_bc1(path: str) -> np.ndarray:
+    """Decode a BC1 (DXT1) DDS file into an RGB uint8 numpy array."""
+    p = Path(path)
+    data = p.read_bytes()
+    if len(data) < 128 or data[:4] != b"DDS ":
+        raise RuntimeError(f"{p}: not a valid DDS")
+
+    header = data[4:4+124]
+    height = struct.unpack_from("<I", header, 8)[0]
+    width = struct.unpack_from("<I", header, 12)[0]
+
+    fourcc = header[80:84]
+    offset = 128
+    if fourcc == b"DX10":
+        offset += 20
+    elif fourcc != b"DXT1":
+        raise RuntimeError(f"{p}: FourCC {fourcc!r} not supported (need DXT1/BC1)")
+
+    bw = (width + 3) // 4
+    bh = (height + 3) // 4
+    shifts = (2 * np.arange(16, dtype=np.uint32))[None, :]
+    out = np.zeros((bh * 4, bw * 4, 3), dtype=np.uint8)
+
+    for by_row in range(bh):
+        row = data[offset + by_row * bw * 8: offset + (by_row + 1) * bw * 8]
+        buf = np.frombuffer(row, dtype=np.uint8).reshape(bw, 8)
+        c0 = buf[:, 0].astype(np.uint16) | (buf[:, 1].astype(np.uint16) << 8)
+        c1 = buf[:, 2].astype(np.uint16) | (buf[:, 3].astype(np.uint16) << 8)
+        idx = (buf[:, 4].astype(np.uint32) | (buf[:, 5].astype(np.uint32) << 8)
+               | (buf[:, 6].astype(np.uint32) << 16) | (buf[:, 7].astype(np.uint32) << 24))
+
+        rgb0 = _rgb565_to_rgb888_np(c0)
+        rgb1 = _rgb565_to_rgb888_np(c1)
+        pal = np.empty((bw, 4, 3), dtype=np.uint8)
+        pal[:, 0] = rgb0
+        pal[:, 1] = rgb1
+        mode4 = c0 > c1
+        c2 = np.empty((bw, 3), dtype=np.uint8)
+        c3 = np.empty((bw, 3), dtype=np.uint8)
+        if np.any(mode4):
+            a, b_ = rgb0[mode4].astype(np.float32), rgb1[mode4].astype(np.float32)
+            c2[mode4] = np.clip(np.rint((2.0 * a + b_) / 3.0), 0, 255).astype(np.uint8)
+            c3[mode4] = np.clip(np.rint((a + 2.0 * b_) / 3.0), 0, 255).astype(np.uint8)
+        if np.any(~mode4):
+            a, b_ = rgb0[~mode4].astype(np.float32), rgb1[~mode4].astype(np.float32)
+            c2[~mode4] = np.clip(np.rint((a + b_) / 2.0), 0, 255).astype(np.uint8)
+            c3[~mode4] = 0
+        pal[:, 2] = c2
+        pal[:, 3] = c3
+        tex_idx = ((idx[:, None] >> shifts) & 3).astype(np.intp)
+        colors = pal[np.arange(bw)[:, None], tex_idx].reshape(bw, 4, 4, 3)
+        row_pixels = colors.transpose(1, 0, 2, 3).reshape(4, bw * 4, 3)
+        out[by_row * 4:(by_row + 1) * 4, :, :] = row_pixels
+
+    return out[:height, :width, :]
+
+
 def main():
     cfg = CONFIG
+    print("\n==================== NTBC Inference ====================")
     res = infer_ntbc_bc1_to_dds_multi(
         coords_json=Path(cfg["coords_json"]),
         merged_ckpt=Path(cfg["merged_ckpt"]),
@@ -478,9 +547,20 @@ def main():
         save_preview_png=bool(cfg["save_preview_png"]),
         out_preview_png=Path(cfg["out_preview_png"]) if cfg.get("out_preview_png") else None,
     )
-    print(f"[SUMMARY] {res.width}x{res.height} blocks={res.blocks_x}x{res.blocks_y} outputs={len(res.out_dds_paths)}")
-    if bool(cfg["pause_on_exit"]):
-        input("Press Enter to exit...")
+
+    # Decode and save reference BC1 DDS as PNGs into inference output dir
+    ref_dds_list = cfg.get("ref_dds") or []
+    out_dir = Path(cfg["inference_output_dir"]).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for ref_path_str in ref_dds_list:
+        ref_path = Path(ref_path_str)
+        if not ref_path.exists():
+            print(f"[WARN] Ref DDS not found, skipping: {ref_path}")
+            continue
+        ref_img = decode_dds_bc1(str(ref_path))
+        ref_png = out_dir / f"{ref_path.stem}.png"
+        Image.fromarray(ref_img, mode="RGB").save(ref_png)
+        print(f"[DONE] Wrote ref PNG: {ref_png}")
 
 
 if __name__ == "__main__":

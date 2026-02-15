@@ -12,8 +12,8 @@ Outputs:
 - merged compressed file: ntbc_bc1_merged_compressed.pt
 
 Dependencies:
-- Network_endpoint_v2.py
-- Network_color_v2.py
+- Network_endpoint.py
+- Network_color.py
 """
 
 from __future__ import annotations
@@ -22,37 +22,42 @@ import json
 import math
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import numpy as np
 from PIL import Image
 
 import torch
 
-from Network_endpoint_v2 import EndpointNetwork, endpoint_loss_bc1_multi
-from Network_color_v2 import ColorNetwork, color_loss_bc1_multi
+from Network_endpoint import EndpointNetwork, endpoint_loss_bc1_multi
+from Network_color import ColorNetwork, color_loss_bc1_multi
 
 from Model_param_compress import compress_state_dict, print_size_comparison
 
 
 # =========================
-# CONFIG (edit these)
+# CONFIG (paths from config.py)
 # =========================
+from config import (
+    TRAIN_DATASET_JSON, SOURCE_IMAGES,
+    OUT_DIR_ENDPOINT, OUT_DIR_COLOR, MODEL_DIR,
+)
+
 CONFIG = {
     # Dataset
-    "endpoint_dataset_json": r"D:\\BC1 extract\\Bricks090_4K-PNG_model\\Train_dataset.json",
+    "endpoint_dataset_json": TRAIN_DATASET_JSON,
 
-    # Optional override. If empty, we will use meta['source_images'] from the dataset.
-    "source_images": [r"D:\BC1 extract\Bricks090_4K-PNG\Bricks090_4K-PNG_Color.png", r"D:\BC1 extract\Bricks090_4K-PNG\Bricks090_4K-PNG_NormalDX.png", r"D:\BC1 extract\Bricks090_4K-PNG\Bricks090_4K-PNG_NormalGL.png" ],
+    # Source images
+    "source_images": SOURCE_IMAGES,
 
     # Run toggles
     "run_endpoint_training": True,
     "run_color_training": True,
 
     # Output folders
-    "out_dir_endpoint": r"D:\\BC1 extract\\Bricks090_4K-PNG_model\\runs_endpoint",
-    "out_dir_color": r"D:\\BC1 extract\\Bricks090_4K-PNG_model\\runs_color",
-    "out_dir_merged": r"D:\\BC1 extract\\Bricks090_4K-PNG_model",
+    "out_dir_endpoint": OUT_DIR_ENDPOINT,
+    "out_dir_color": OUT_DIR_COLOR,
+    "out_dir_merged": MODEL_DIR,
 
     # Training schedule (paper)
     "main_steps": 20_000,
@@ -83,7 +88,7 @@ CONFIG = {
 
     # Logging / saving
     "log_every_steps": 50,
-    "save_every_steps": 10000,
+    "save_every_steps": 5000,
 
     # Repro
     "seed": 0,
