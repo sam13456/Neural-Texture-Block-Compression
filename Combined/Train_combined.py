@@ -63,6 +63,7 @@ CONFIG = {
     "main_steps": 20_000,
     "qat_tail_fraction": 0.10,
     "warmup_steps": 10,
+    "qat_warmup_steps": 10,        # warmup for the QAT tail's own cosine schedule
 
     # Optimizer (paper)
     "lr_grid": 1e-2,
@@ -77,9 +78,9 @@ CONFIG = {
     "qat_bits": 8,
     "freeze_grids_during_qat": True,
 
-    # Batch sizes
-    "batch_size_blocks": 2048,
-    "batch_size_texels": 65536,
+    # Batch sizes (doubled from paper defaults for better GPU utilization)
+    "batch_size_blocks": 4096,
+    "batch_size_texels": 131072,
 
     # Mixed precision
     "device": "cuda" if torch.cuda.is_available() else "cpu",
@@ -178,13 +179,16 @@ _OFF_Y = torch.tensor([
 
 
 def extract_block_colors_batch_u8_multi(imgs_thwc_u8: torch.Tensor, bxby_batch: torch.Tensor) -> torch.Tensor:
-    """imgs_thwc_u8: (T,H,W,3) uint8 CPU; bxby_batch: (B,2) -> (B,T,16,3) uint8 CPU"""
+    """imgs_thwc_u8: (T,H,W,3) uint8; bxby_batch: (B,2) -> (B,T,16,3) uint8"""
+    dev = bxby_batch.device
     bx = bxby_batch[:, 0]
     by = bxby_batch[:, 1]
     base_x = bx * 4
     base_y = by * 4
-    x = base_x[:, None] + _OFF_X[None, :]
-    y = base_y[:, None] + _OFF_Y[None, :]
+    off_x = _OFF_X.to(dev)
+    off_y = _OFF_Y.to(dev)
+    x = base_x[:, None] + off_x[None, :]
+    y = base_y[:, None] + off_y[None, :]
 
     # imgs[:, y, x] -> (T,B,16,3)
     out = imgs_thwc_u8[:, y, x]
@@ -246,18 +250,19 @@ def train_endpoint_network(cfg: dict, endpoint_dataset_json: Path, out_dir: Path
     st_np[:, 0] = bxby_np[:, 0] / max(blocks_x - 1, 1)
     st_np[:, 1] = bxby_np[:, 1] / max(blocks_y - 1, 1)
 
-    st_t = torch.from_numpy(st_np)          # (N,2) CPU
-    bxby_t = torch.from_numpy(bxby_np)      # (N,2) CPU
-    ep_t = torch.from_numpy(ep_np)          # (N,6*T) CPU
+    # Move all training data to GPU to eliminate per-step CPU->GPU transfers
+    st_t = torch.from_numpy(st_np).to(device)
+    bxby_t = torch.from_numpy(bxby_np).to(device)
+    ep_t = torch.from_numpy(ep_np).to(device)
 
     # load stacked images
     src_paths = resolve_source_images(cfg, meta)
     for p in src_paths:
         if not p.exists():
             raise FileNotFoundError(f"Source image not found: {p}")
-    imgs_thwc_u8 = load_images_stack_u8(src_paths, blocks_x, blocks_y)  # (T,H,W,3)
+    imgs_thwc_u8 = load_images_stack_u8(src_paths, blocks_x, blocks_y).to(device)  # (T,H,W,3) GPU
     H, W = int(imgs_thwc_u8.shape[1]), int(imgs_thwc_u8.shape[2])
-    print(f"[Endpoint] Loaded {len(src_paths)} images (padded): {W}x{H}")
+    print(f"[Endpoint] Loaded {len(src_paths)} images (padded): {W}x{H}, all data on {device}")
 
     # Model
     net = EndpointNetwork(num_textures=T, param_dtype=param_dtype).to(device)
@@ -286,10 +291,14 @@ def train_endpoint_network(cfg: dict, endpoint_dataset_json: Path, out_dir: Path
     freeze_grids = bool(cfg["freeze_grids_during_qat"])
     grid_lr_mul = 1.0
 
+    qat_warmup_steps = int(cfg.get("qat_warmup_steps", 10))
+    in_qat = False
+
     print(f"[Endpoint] Train steps: main={main_steps}, qat_tail={qat_tail_steps}, total={total_steps}")
 
     run_total = run_le = run_lcd = 0.0
     run_count = 0
+    t_train_start = time.time()
     t0 = time.time()
 
     autocast_device = "cuda" if device.startswith("cuda") else "cpu"
@@ -298,25 +307,29 @@ def train_endpoint_network(cfg: dict, endpoint_dataset_json: Path, out_dir: Path
         if step == qat_start_step and qat_tail_steps > 0:
             print("[Endpoint] >>> Enabling grid QAT <<<")
             net.encoding.enable_qat(bits=int(cfg["qat_bits"]))
+            in_qat = True
             if freeze_grids:
                 print("[Endpoint] >>> Freezing grids during QAT tail <<<")
                 grid_lr_mul = 0.0
+            print("[Endpoint] >>> Resetting MLP cosine LR for QAT tail <<<")
             save_checkpoint(out_dir, f"endpoint_net_bc1_step{step:06d}_qat_start.pt", cfg, meta, net, optimizer, step)
 
-        didx = torch.randint(0, N, (batch_size,), device="cpu", dtype=torch.long)
+        didx = torch.randint(0, N, (batch_size,), device=device, dtype=torch.long)
 
-        st = st_t[didx]          # (B,2) CPU
-        bxby = bxby_t[didx]      # (B,2) CPU
-        ref_ep = ep_t[didx]      # (B,6*T) CPU
+        st = st_t[didx]          # (B,2) already on GPU
+        bxby = bxby_t[didx]      # (B,2) already on GPU
+        ref_ep = ep_t[didx]      # (B,6*T) already on GPU
 
-        # (B,T,16,3) uint8 -> float
+        # (B,T,16,3) uint8 -> float (all on GPU)
         ref_cols_u8 = extract_block_colors_batch_u8_multi(imgs_thwc_u8, bxby)
-        ref_cols = (ref_cols_u8.to(torch.float32) / 255.0).to(device=device, non_blocking=True)
+        ref_cols = ref_cols_u8.to(torch.float32) / 255.0
 
-        st = st.to(device=device, dtype=torch.float32, non_blocking=True)
-        ref_ep = ref_ep.to(device=device, dtype=torch.float32, non_blocking=True)
-
-        lr_scale = lr_scale_warmup_cos(step, total_steps, warmup_steps)
+        # LR schedule: separate cosine for main phase vs QAT tail
+        if in_qat:
+            qat_local_step = step - qat_start_step
+            lr_scale = lr_scale_warmup_cos(qat_local_step, qat_tail_steps, qat_warmup_steps)
+        else:
+            lr_scale = lr_scale_warmup_cos(step, main_steps, warmup_steps)
         set_lrs(optimizer, lr_scale, float(cfg["lr_grid"]), float(cfg["lr_mlp"]), grid_lr_mul=grid_lr_mul)
 
         optimizer.zero_grad(set_to_none=True)
@@ -362,6 +375,10 @@ def train_endpoint_network(cfg: dict, endpoint_dataset_json: Path, out_dir: Path
 
     save_checkpoint(out_dir, "endpoint_net_bc1_final.pt", cfg, meta, net, optimizer, total_steps)
 
+    elapsed = time.time() - t_train_start
+    mins, secs = divmod(elapsed, 60)
+    print(f"[Endpoint] Training complete in {int(mins)}m {secs:.1f}s")
+
     original_sd = net.state_dict()
     compressed_sd = compress_state_dict(original_sd)
     print("[Endpoint] Compressed state_dict:")
@@ -389,17 +406,19 @@ def train_color_network(cfg: dict, endpoint_dataset_json: Path, out_dir: Path):
     T = infer_num_textures(ep_np, meta)
     print(f"[Color] Dataset: N={N}, blocks=({blocks_x},{blocks_y}), tex={width}x{height}, T={T}")
 
-    bxby_t = torch.from_numpy(bxby_np.astype(np.int64))
-    ep_t = torch.from_numpy(ep_np.astype(np.float32))
+    # Move all training data to GPU
+    bxby_t = torch.from_numpy(bxby_np.astype(np.int64)).to(device)
+    ep_t = torch.from_numpy(ep_np.astype(np.float32)).to(device)
 
     src_paths = resolve_source_images(cfg, meta)
     for p in src_paths:
         if not p.exists():
             raise FileNotFoundError(f"Source image not found: {p}")
-    imgs_thwc_u8 = load_images_stack_u8(src_paths, blocks_x, blocks_y)  # (T,H,W,3)
+    imgs_thwc_u8 = load_images_stack_u8(src_paths, blocks_x, blocks_y).to(device)  # (T,H,W,3) GPU
     H, W = int(imgs_thwc_u8.shape[1]), int(imgs_thwc_u8.shape[2])
-    print(f"[Color] Loaded {len(src_paths)} images (padded): {W}x{H}")
+    print(f"[Color] Loaded {len(src_paths)} images (padded): {W}x{H}, all data on {device}")
 
+    # Model
     net = ColorNetwork(num_textures=T, param_dtype=param_dtype, finest_resolution=2048).to(device)
     net.train()
 
@@ -426,10 +445,14 @@ def train_color_network(cfg: dict, endpoint_dataset_json: Path, out_dir: Path):
     freeze_grids = bool(cfg["freeze_grids_during_qat"])
     grid_lr_mul = 1.0
 
+    qat_warmup_steps = int(cfg.get("qat_warmup_steps", 10))
+    in_qat = False
+
     print(f"[Color] Train steps: main={main_steps}, qat_tail={qat_tail_steps}, total={total_steps}")
 
     run_total = run_lc = run_lcd = 0.0
     run_count = 0
+    t_train_start = time.time()
     t0 = time.time()
 
     autocast_device = "cuda" if device.startswith("cuda") else "cpu"
@@ -438,33 +461,38 @@ def train_color_network(cfg: dict, endpoint_dataset_json: Path, out_dir: Path):
         if step == qat_start_step and qat_tail_steps > 0:
             print("[Color] >>> Enabling grid QAT <<<")
             net.encoding.enable_qat(bits=int(cfg["qat_bits"]))
+            in_qat = True
             if freeze_grids:
                 print("[Color] >>> Freezing grids during QAT tail <<<")
                 grid_lr_mul = 0.0
+            print("[Color] >>> Resetting MLP cosine LR for QAT tail <<<")
             save_checkpoint(out_dir, f"color_net_bc1_step{step:06d}_qat_start.pt", cfg, meta, net, optimizer, step)
 
-        didx = torch.randint(0, N, (batch_size,), device="cpu", dtype=torch.long)
+        didx = torch.randint(0, N, (batch_size,), device=device, dtype=torch.long)
 
-        bxby = bxby_t[didx]
-        ref_ep = ep_t[didx]
+        bxby = bxby_t[didx]    # already on GPU
+        ref_ep = ep_t[didx]    # already on GPU
 
-        ox = torch.randint(0, 4, (batch_size,), device="cpu", dtype=torch.long)
-        oy = torch.randint(0, 4, (batch_size,), device="cpu", dtype=torch.long)
+        ox = torch.randint(0, 4, (batch_size,), device=device, dtype=torch.long)
+        oy = torch.randint(0, 4, (batch_size,), device=device, dtype=torch.long)
 
         px = (bxby[:, 0] * 4 + ox).clamp(0, W - 1)
         py = (bxby[:, 1] * 4 + oy).clamp(0, H - 1)
 
-        # Reference per-texel colors for ALL textures
+        # Reference per-texel colors for ALL textures (all on GPU)
         ref_rgb_u8 = imgs_thwc_u8[:, py, px]  # (T,B,3)
-        ref_rgb = (ref_rgb_u8.permute(1, 0, 2).to(torch.float32) / 255.0).to(device=device, non_blocking=True)  # (B,T,3)
+        ref_rgb = ref_rgb_u8.permute(1, 0, 2).to(torch.float32) / 255.0  # (B,T,3)
 
-        u = (px.to(torch.float32) / float(max(1, W - 1))).to(device=device, non_blocking=True)
-        v = (py.to(torch.float32) / float(max(1, H - 1))).to(device=device, non_blocking=True)
+        u = px.to(torch.float32) / float(max(1, W - 1))
+        v = py.to(torch.float32) / float(max(1, H - 1))
         uv = torch.stack([u, v], dim=1)
 
-        ref_ep = ref_ep.to(device=device, dtype=torch.float32, non_blocking=True)
-
-        lr_scale = lr_scale_warmup_cos(step, total_steps, warmup_steps)
+        # LR schedule: separate cosine for main phase vs QAT tail
+        if in_qat:
+            qat_local_step = step - qat_start_step
+            lr_scale = lr_scale_warmup_cos(qat_local_step, qat_tail_steps, qat_warmup_steps)
+        else:
+            lr_scale = lr_scale_warmup_cos(step, main_steps, warmup_steps)
         set_lrs(optimizer, lr_scale, float(cfg["lr_grid"]), float(cfg["lr_mlp"]), grid_lr_mul=grid_lr_mul)
 
         optimizer.zero_grad(set_to_none=True)
@@ -510,6 +538,10 @@ def train_color_network(cfg: dict, endpoint_dataset_json: Path, out_dir: Path):
 
     save_checkpoint(out_dir, "color_net_bc1_final.pt", cfg, meta, net, optimizer, total_steps)
 
+    elapsed = time.time() - t_train_start
+    mins, secs = divmod(elapsed, 60)
+    print(f"[Color] Training complete in {int(mins)}m {secs:.1f}s")
+
     original_sd = net.state_dict()
     compressed_sd = compress_state_dict(original_sd)
     print("[Color] Compressed state_dict:")
@@ -531,8 +563,10 @@ def merge_compressed_state_dicts(endpoint_sd: Dict[str, torch.Tensor], color_sd:
 
 
 def main():
+    t_total_start = time.time()
     cfg = CONFIG
     set_seed(int(cfg["seed"]))
+    torch.backends.cudnn.benchmark = True
 
     endpoint_dataset_json = Path(cfg["endpoint_dataset_json"]).expanduser().resolve()
     out_dir_ep = Path(cfg["out_dir_endpoint"]).expanduser().resolve()
@@ -577,6 +611,10 @@ def main():
                 print(f"[CLEANUP] Deleted: {d}")
     else:
         print("\n[WARN] Skipped merging: train both networks to produce merged file.")
+
+    total_elapsed = time.time() - t_total_start
+    mins, secs = divmod(total_elapsed, 60)
+    print(f"\n[TOTAL] Pipeline complete in {int(mins)}m {secs:.1f}s")
 
 
 if __name__ == "__main__":

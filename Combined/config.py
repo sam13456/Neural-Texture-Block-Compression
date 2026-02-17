@@ -15,15 +15,15 @@ COMPRESSONATOR_CLI = r"D:\Compressonatorcli\bin\CLI\compressonatorcli.exe"
 
 # Source texture images (all must share the same resolution)
 SOURCE_IMAGES = [
-    r"D:\BC1 extract\Bricks090_4K-PNG\Bricks090_4K-PNG_Color.png",
-    r"D:\BC1 extract\Bricks090_4K-PNG\Bricks090_4K-PNG_NormalDX.png"
+    r"D:\BC1 extract\Data\Bricks090_4K-PNG\Bricks090_4K-PNG_Color.png",
+    r"D:\BC1 extract\Data\Bricks090_4K-PNG\Bricks090_4K-PNG_NormalDX.png"
 ]
 
 # Human-readable names matching SOURCE_IMAGES (used for output naming)
 TEXTURE_NAMES = ["Color", "NormalDX"]
 
 # Output directory (everything goes here: dataset, training, inference)
-MODEL_DIR = r"D:\BC1 extract\Bricks090_4K-PNG_model"
+MODEL_DIR = r"D:\BC1 extract\Bricks090_4K-PNG_model_fast"
 
 
 # ==================== DERIVED PATHS (auto) ====================

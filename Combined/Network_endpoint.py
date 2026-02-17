@@ -43,6 +43,33 @@ def _fake_quantize_asymmetric_with_range(
     return x_clamped + (x_q - x_clamped).detach()
 
 
+def _fake_quantize_rgb565_ste(endpoints6: torch.Tensor) -> torch.Tensor:
+    """Fake-quantize 6-channel endpoints to RGB565 levels with STE.
+
+    Input/output: (..., 6) in [0,1] = [r0,g0,b0,r1,g1,b1]
+    Each channel is rounded to its RGB565 grid:
+      R,B channels: 32 levels (5-bit) -> round(x*31)/31
+      G channels:   64 levels (6-bit) -> round(x*63)/63
+    STE: forward uses hard rounding, backward passes gradients straight through.
+    """
+    # Channel-wise quantization levels: [r0, g0, b0, r1, g1, b1]
+    levels = torch.tensor([31.0, 63.0, 31.0, 31.0, 63.0, 31.0],
+                          device=endpoints6.device, dtype=endpoints6.dtype)
+    # Broadcast levels to match arbitrary leading dims
+    shape = [1] * (endpoints6.ndim - 1) + [6]
+    lv = levels.view(*shape)
+
+    scaled = (endpoints6 * lv).round()
+    clamped = torch.min(torch.max(scaled, torch.zeros_like(scaled)), lv)
+    quantized = clamped / lv
+    # STE: forward = quantized, backward = identity
+    return endpoints6 + (quantized - endpoints6).detach()
+
+
+
+
+
+
 # ---------- Utilities (BC1) ----------
 
 _BC1_W = torch.tensor([0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0], dtype=torch.float32)  # w_n = n/3 for n=0..3 (Eq. 7)
@@ -330,8 +357,12 @@ def endpoint_loss_bc1(
     # L_e: MSE between predicted and reference endpoints (paper: L2)
     le = F.mse_loss(pred_endpoints6, ref_endpoints6, reduction=reduction)
 
-    # Build palette from predicted endpoints (for distance computation)
-    pred_e0, pred_e1 = endpoints6_to_e0e1(pred_endpoints6)
+    # Fake-quantize predicted endpoints to RGB565 levels (STE)
+    # Paper Sec 3.2: "endpoint network outputs two colors in RGB5:6:5 format"
+    pred_q = _fake_quantize_rgb565_ste(pred_endpoints6)
+
+    # Build palette from RGB565-quantized predicted endpoints (matches inference)
+    pred_e0, pred_e1 = endpoints6_to_e0e1(pred_q)
     w = _BC1_W.to(device=pred_endpoints6.device, dtype=pred_endpoints6.dtype)
     pal_pred = bc1_palette_from_endpoints(pred_e0, pred_e1, w=w)  # (B,4,3)
 
