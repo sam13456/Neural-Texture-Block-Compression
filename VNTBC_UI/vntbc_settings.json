@@ -1,0 +1,55 @@
+{
+  "compressonator_cli": "D:/Compressonatorcli/bin/CLI/compressonatorcli.exe",
+  "run_evaluation": true,
+  "generate_diff_maps": true,
+  "advanced": {
+    "main_steps": 20000,
+    "lr_grid": 0.013,
+    "lr_mlp": 0.005,
+    "temperature": 0.01,
+    "batch_size_blocks": 5096,
+    "batch_size_texels": 131072,
+    "log_every_steps": 100,
+    "save_every_steps": 10000,
+    "bc1_use_lpe": true,
+    "bc4_use_lpe": true,
+    "bc1_qat_bits_endpoint": [
+      8,
+      8,
+      8,
+      8,
+      8,
+      8,
+      8
+    ],
+    "bc1_qat_bits_color": [
+      8,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4
+    ],
+    "bc4_qat_bits_endpoint": [
+      8,
+      4,
+      4,
+      4,
+      4,
+      4,
+      8
+    ],
+    "bc4_qat_bits_color": [
+      8,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4
+    ]
+  }
+}
