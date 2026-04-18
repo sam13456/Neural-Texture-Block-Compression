@@ -15,16 +15,19 @@ COMPRESSONATOR_CLI = r"D:\Compressonatorcli\bin\CLI\compressonatorcli.exe"
 
 # Source texture images — single-channel (grayscale) textures for BC4
 SOURCE_IMAGES = [
-    r"D:\BC1 extract\Data\aerial_rocks_02_4k\aerial_rocks_02_disp_4k.png",
-    r"D:\BC1 extract\Data\aerial_rocks_02_4k\aerial_rocks_02_ao_4k.png",
-    r"D:\BC1 extract\Data\aerial_rocks_02_4k\aerial_rocks_02_rough_4k.png"
+    r"D:\BC1 extract\Data\MetalPlates013_4K-PNG\MetalPlates013_4K-PNG_Displacement.png",
+    r"D:\BC1 extract\Data\MetalPlates013_4K-PNG\MetalPlates013_4K-PNG_Roughness.png",
+    r"D:\BC1 extract\Data\MetalPlates013_4K-PNG\MetalPlates013_4K-PNG_AmbientOcclusion.png",
+    r"D:\BC1 extract\Data\MetalPlates013_4K-PNG\MetalPlates013_4K-PNG_Metalness.png"
+   
 ]
 
 # Human-readable names matching SOURCE_IMAGES (used for output naming)
-TEXTURE_NAMES = ["Disp", "AO", "Rough"]
+TEXTURE_NAMES = ["Displacement","Roughness","AO","Metalness"]
+
 
 # Output directory (everything goes here: dataset, training, inference)
-MODEL_DIR = r"D:\BC1 extract\aerial_rocks_02_4k_model_bc4"
+MODEL_DIR = r"D:\BC1 extract\NTBC_Outputs\BC4\MetalPlates013_4K-PNG_model_vbc4"
 
 
 # ==================== DERIVED PATHS (auto) ====================
