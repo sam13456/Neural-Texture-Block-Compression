@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from Network_endpoint import bc4_palette_bc4order
+from Network_endpoint_BC4 import bc4_palette_bc4order
 
 
 # ---------- Quantization helpers ----------

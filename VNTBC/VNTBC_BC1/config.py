@@ -15,21 +15,21 @@ COMPRESSONATOR_CLI = r"D:\Compressonatorcli\bin\CLI\compressonatorcli.exe"
 
 # Source texture images (all must share the same resolution)
 SOURCE_IMAGES = [
-    r"D:\BC1 extract\Data\aerial_rocks_02_4k\aerial_rocks_02_diff_4k.png",
-    r"D:\BC1 extract\Data\aerial_rocks_02_4k\aerial_rocks_02_nor_dx_4k.png",
+    r"D:\BC1 extract\Data\MetalPlates013_4K-PNG\MetalPlates013_4K-PNG_Color.png",
+    r"D:\BC1 extract\Data\MetalPlates013_4K-PNG\MetalPlates013_4K-PNG_NormalDX.png",
 ]
 
 # Human-readable names matching SOURCE_IMAGES (used for output naming)
 TEXTURE_NAMES = ["Color", "Normal"]
 
 # Output directory (everything goes here: dataset, training, inference)
-MODEL_DIR = r"D:\BC1 extract\PavingStones070_4K-PNG_model_lpe"
+MODEL_DIR = r"D:\BC1 extract\VNTBC_Outputs\BC1\MetalPlates013_4K-PNG_model_bc1"
 
 # ==================== VBQ CONFIGURATION ====================
 # Number of bits per resolution level for Quantization-Aware Training.
 # Length must match num_levels in the respective network (7 for endpoint, 8 for color).
 QAT_BITS_ENDPOINT = [8, 8, 8, 8, 8, 8, 8]
-QAT_BITS_COLOR = [8, 8, 8, 8, 4, 4, 4, 4]
+QAT_BITS_COLOR = [8, 4, 4, 4, 4, 4, 4, 4]
 
 # ==================== LOCAL POSITIONAL ENCODING (LPE) ====================
 # NTBC future scope: append high-frequency sinusoidal position features to the

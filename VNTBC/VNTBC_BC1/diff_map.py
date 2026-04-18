@@ -17,10 +17,10 @@ from PIL import Image
 # ==================== CONFIG ====================
 
 # Reference image (ground truth / Compressonator BC1 decode)
-REFERENCE_IMAGE = r"D:\BC1 extract\roof_09_4k_model_lpe_tuned\inference_output\roof_09_diff_4k_ref_bc1.png"
+REFERENCE_IMAGE = r"D:\BC1 extract\VNTBC_Outputs\BC4\MetalPlates013_4K-PNG_model_vbc4_am\inference_output\MetalPlates013_4K-PNG_AmbientOcclusion_ref_bc4.png"
 
 # Output image (NTBC inference preview)
-OUTPUT_IMAGE = r"D:\BC1 extract\roof_09_4k_model_lpe_tuned\inference_output\ntbc_out_preview_Color.png"
+OUTPUT_IMAGE = r"D:\BC1 extract\VNTBC_Outputs\BC4\MetalPlates013_4K-PNG_model_vbc4_am\inference_output\ntbc_out_preview_AO.png"
 
 # Amplification factor — higher = subtle differences become more visible
 AMPLIFY = 5.0

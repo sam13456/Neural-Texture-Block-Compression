@@ -13,7 +13,7 @@ Paper-style evaluation for BC4:
 # =============================================================================
 # CONFIG
 # =============================================================================
-from config import (
+from config_BC4 import (
     SOURCE_IMAGES, REF_DDS, TEST_DDS,
 )
 
@@ -47,7 +47,11 @@ from skimage.metrics import structural_similarity as ssim_fn
 # -----------------------------
 def load_grayscale(path: str) -> np.ndarray:
     """Load image as grayscale uint8 (H,W)."""
-    return np.asarray(Image.open(path).convert("L"), dtype=np.uint8)
+    img = Image.open(path)
+    if img.mode == "I;16":
+        arr = np.array(img, dtype=np.float32)
+        return (arr / 256.0).clip(0, 255).astype(np.uint8)
+    return np.asarray(img.convert("L"), dtype=np.uint8)
 
 
 def resize_max_side(arr_u8: np.ndarray, max_side: Optional[int]) -> np.ndarray:

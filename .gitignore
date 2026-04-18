@@ -1,10 +1,10 @@
 /.venv
-/Bricks090_2K-PNG
-/Endpoints_Extract_Training.py
-/Endpoint_network_old
-/NTBC_paper.pdf
-/Combined_ancient
-/Bricks090_8K-PNG
-/Bricks090_diffuse_8K
-/Old Stuff
-/Bricks090_diffuse
+Data
+NTBC_Outputs
+Old Stuff
+VNTBC_Outputs
+VBQ.pdf
+vbq_text.txt
+/.agents
+Paper stuff
+__pycache__

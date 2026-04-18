@@ -18,23 +18,24 @@ COMPRESSONATOR_CLI = r"D:\Compressonatorcli\bin\CLI\compressonatorcli.exe"
 
 # Source texture images — single-channel (grayscale) textures for BC4
 SOURCE_IMAGES = [
-    r"D:\BC1 extract\Data\Carpet015_4K-PNG\Carpet015_4K-PNG_AmbientOcclusion.png",
-    r"D:\BC1 extract\Data\Carpet015_4K-PNG\Carpet015_4K-PNG_Displacement.png",
-    r"D:\BC1 extract\Data\Carpet015_4K-PNG\Carpet015_4K-PNG_Roughness.png"
+    r"D:\BC1 extract\Data\PavingStones070_4K-PNG\PavingStones070_4K-PNG_Displacement.png",
+    r"D:\BC1 extract\Data\PavingStones070_4K-PNG\PavingStones070_4K-PNG_AmbientOcclusion.png",
+    r"D:\BC1 extract\Data\PavingStones070_4K-PNG\PavingStones070_4K-PNG_Roughness.png"
+   
 ]
 
 # Human-readable names matching SOURCE_IMAGES (used for output naming)
-TEXTURE_NAMES = ["AO", "Disp","Roughness"]
+TEXTURE_NAMES = ["Disp","AO","Roughness"]
 
 # Output directory (everything goes here: dataset, training, inference)
-MODEL_DIR = r"D:\BC1 extract\Carpet015_4K-PNG_model_vbc4"
+MODEL_DIR = r"D:\BC1 extract\VNTBC_Outputs\BC4\PavingStones070_4K-PNG_model_vbc4"
 
 
 # ==================== VBQ CONFIGURATION ====================
 # Number of bits per resolution level for Quantization-Aware Training.
 # Length must match num_levels in the respective network (7 for endpoint, 8 for color).
 QAT_BITS_ENDPOINT = [8, 4, 4, 4, 4, 4, 8]
-QAT_BITS_COLOR = [8, 8, 8, 8, 4, 4, 4, 4]
+QAT_BITS_COLOR = [8, 4, 4, 4, 4, 4, 4, 4]
 
 
 # ==================== LOCAL POSITIONAL ENCODING (LPE) ====================

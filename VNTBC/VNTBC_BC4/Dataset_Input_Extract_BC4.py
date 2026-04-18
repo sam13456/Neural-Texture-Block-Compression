@@ -29,7 +29,7 @@ DXGI_FORMAT_BC4_SNORM = 81
 # =========================
 # CONFIG
 # =========================
-from config import (
+from config_BC4 import (
     COMPRESSONATOR_CLI, SOURCE_IMAGES, TEXTURE_NAMES, MODEL_DIR,
 )
 

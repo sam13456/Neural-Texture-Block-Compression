@@ -29,16 +29,16 @@ from PIL import Image
 
 import torch
 
-from Network_endpoint import EndpointNetwork, bc4_palette_bc4order
-from Network_color import ColorNetwork
+from Network_endpoint_BC4 import EndpointNetwork, bc4_palette_bc4order
+from Network_color_BC4 import ColorNetwork
 
-from Model_param_compress import decompress_state_dict
+from Model_param_compress_BC4 import decompress_state_dict
 
 
 # =========================
 # CONFIG
 # =========================
-from config import (
+from config_BC4 import (
     INFERENCE_INPUT_JSON, MERGED_CHECKPOINT, OUT_DDS, OUT_PREVIEW_PNG,
     REF_DDS, INFERENCE_OUTPUT_DIR,
 )
